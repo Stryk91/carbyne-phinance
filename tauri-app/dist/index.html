@@ -312,6 +312,70 @@
                 grid-template-columns: 1fr;
             }
         }
+
+        /* Auto-refresh toggle */
+        .auto-refresh-controls {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px 15px;
+            background: var(--bg-card);
+            border-radius: 8px;
+            margin-left: 20px;
+        }
+
+        .toggle-switch {
+            position: relative;
+            width: 50px;
+            height: 26px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: var(--border);
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: var(--text-primary);
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+
+        .toggle-switch input:checked + .toggle-slider {
+            background-color: var(--success);
+        }
+
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+        }
+
+        .refresh-status {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .refresh-status.active {
+            color: var(--success);
+        }
     </style>
 </head>
 <body>
@@ -324,8 +388,21 @@
                     <div class="stat-label">Symbols</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-value" id="record-count">0</div>
-                    <div class="stat-label">Records</div>
+                    <div class="stat-value" id="last-refresh">--:--</div>
+                    <div class="stat-label">Last Update</div>
+                </div>
+                <div class="auto-refresh-controls">
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="auto-refresh-toggle" onchange="toggleAutoRefresh()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                    <select id="refresh-interval" onchange="updateRefreshInterval()" style="padding: 5px 10px;">
+                        <option value="60000">1 min</option>
+                        <option value="300000" selected>5 min</option>
+                        <option value="900000">15 min</option>
+                        <option value="1800000">30 min</option>
+                    </select>
+                    <span id="refresh-status" class="refresh-status">Auto-refresh off</span>
                 </div>
             </div>
         </header>
@@ -1013,6 +1090,98 @@
             }
         }
 
+        // Auto-refresh functionality
+        let autoRefreshTimer = null;
+
+        function updateLastRefreshTime() {
+            const now = new Date();
+            document.getElementById('last-refresh').textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function toggleAutoRefresh() {
+            const toggle = document.getElementById('auto-refresh-toggle');
+            const statusEl = document.getElementById('refresh-status');
+
+            if (toggle.checked) {
+                startAutoRefresh();
+                statusEl.textContent = 'Auto-refresh on';
+                statusEl.classList.add('active');
+            } else {
+                stopAutoRefresh();
+                statusEl.textContent = 'Auto-refresh off';
+                statusEl.classList.remove('active');
+            }
+        }
+
+        function updateRefreshInterval() {
+            const toggle = document.getElementById('auto-refresh-toggle');
+            if (toggle.checked) {
+                stopAutoRefresh();
+                startAutoRefresh();
+            }
+        }
+
+        function startAutoRefresh() {
+            const interval = parseInt(document.getElementById('refresh-interval').value);
+            log(`Auto-refresh started (every ${interval / 60000} min)`, 'info');
+
+            // Do initial refresh
+            autoRefreshPrices();
+
+            // Set up interval
+            autoRefreshTimer = setInterval(autoRefreshPrices, interval);
+        }
+
+        function stopAutoRefresh() {
+            if (autoRefreshTimer) {
+                clearInterval(autoRefreshTimer);
+                autoRefreshTimer = null;
+                log('Auto-refresh stopped', 'info');
+            }
+        }
+
+        async function autoRefreshPrices() {
+            try {
+                // Get all tracked symbols
+                const symbols = await invoke('get_symbols');
+                if (!symbols || symbols.length === 0) {
+                    log('No symbols to refresh', 'info');
+                    updateLastRefreshTime();
+                    return;
+                }
+
+                // Fetch latest prices for all symbols
+                const symbolList = symbols.map(s => s.symbol).join(',');
+                log(`Auto-refreshing ${symbols.length} symbols...`, 'info');
+
+                const result = await invoke('fetch_prices', { symbols: symbolList, period: '1d' });
+
+                if (result.success) {
+                    log(`Auto-refresh: ${result.message}`, 'success');
+                } else {
+                    log(`Auto-refresh warning: ${result.message}`, 'error');
+                }
+
+                // Update the list
+                await refreshList();
+                updateLastRefreshTime();
+
+                // Check alerts silently (no popup unless triggered)
+                const triggered = await invoke('check_alerts');
+                if (triggered && triggered.length > 0) {
+                    const messages = triggered.map(a =>
+                        `${a.symbol} ${a.condition === 'above' ? 'reached' : 'dropped to'} $${a.target_price.toFixed(2)}`
+                    ).join('\n');
+                    alert(`Alerts triggered!\n\n${messages}`);
+                    log(`${triggered.length} alerts triggered!`, 'success');
+                    await loadAlerts();
+                }
+
+            } catch (e) {
+                log('Auto-refresh error: ' + e, 'error');
+            }
+        }
+
         // Form submission
         document.getElementById('fetch-form').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -1027,6 +1196,7 @@
         document.addEventListener('DOMContentLoaded', () => {
             log('Financial Pipeline UI loaded', 'success');
             refreshList();
+            updateLastRefreshTime();
         });
     </script>
 </body>
