@@ -612,18 +612,29 @@
                 const list = document.getElementById('symbol-list');
 
                 if (symbols && symbols.length > 0) {
-                    list.innerHTML = symbols.map(s => `
+                    list.innerHTML = symbols.map(s => {
+                        const changeColor = s.change_direction === 'up' ? 'var(--success)' :
+                                           s.change_direction === 'down' ? 'var(--error)' : 'var(--text-secondary)';
+                        const changeSign = s.change_percent >= 0 ? '+' : '';
+                        const arrow = s.change_direction === 'up' ? '▲' :
+                                     s.change_direction === 'down' ? '▼' : '';
+                        return `
                         <li class="symbol-item" onclick="toggleSymbolMenu('${s.symbol}')">
                             <div style="display: flex; justify-content: space-between; align-items: center;">
                                 <span class="symbol-ticker">${s.symbol}</span>
-                                <span class="symbol-price">$${s.price.toFixed(2)}</span>
+                                <div style="text-align: right;">
+                                    <span class="symbol-price" style="color: ${changeColor};">$${s.price.toFixed(2)}</span>
+                                    <span style="color: ${changeColor}; font-size: 0.85rem; margin-left: 8px;">
+                                        ${arrow} ${changeSign}${s.change_percent.toFixed(2)}%
+                                    </span>
+                                </div>
                             </div>
                             <div id="menu-${s.symbol}" class="symbol-menu" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);">
                                 <button onclick="event.stopPropagation(); viewIndicators('${s.symbol}')" style="margin-right: 5px;">View Indicators</button>
                                 <button onclick="event.stopPropagation(); exportSymbol('${s.symbol}')" class="btn-secondary">Export CSV</button>
                             </div>
                         </li>
-                    `).join('');
+                    `}).join('');
                     document.getElementById('symbol-count').textContent = symbols.length;
                     log(`Loaded ${symbols.length} symbols`, 'success');
                 } else {

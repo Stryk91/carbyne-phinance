@@ -10,11 +10,13 @@ struct AppState {
     db: Mutex<Database>,
 }
 
-/// Symbol with latest price
+/// Symbol with latest price and percent change
 #[derive(Serialize)]
 struct SymbolPrice {
     symbol: String,
     price: f64,
+    change_percent: f64,
+    change_direction: String, // "up", "down", or "unchanged"
 }
 
 /// Command result
@@ -32,7 +34,7 @@ struct IndicatorData {
     date: String,
 }
 
-/// Get all symbols with their latest prices
+/// Get all symbols with their latest prices and percent change
 #[tauri::command]
 fn get_symbols(state: State<AppState>) -> Result<Vec<SymbolPrice>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -41,8 +43,40 @@ fn get_symbols(state: State<AppState>) -> Result<Vec<SymbolPrice>, String> {
 
     let mut result = Vec::new();
     for symbol in symbols {
-        if let Ok(Some(price)) = db.get_latest_price(&symbol) {
-            result.push(SymbolPrice { symbol, price });
+        // Get price history to calculate percent change
+        if let Ok(prices) = db.get_prices(&symbol) {
+            if prices.len() >= 2 {
+                let current = prices.last().unwrap();
+                let previous = &prices[prices.len() - 2];
+
+                let change_percent = if previous.close > 0.0 {
+                    ((current.close - previous.close) / previous.close) * 100.0
+                } else {
+                    0.0
+                };
+
+                let change_direction = if change_percent > 0.001 {
+                    "up".to_string()
+                } else if change_percent < -0.001 {
+                    "down".to_string()
+                } else {
+                    "unchanged".to_string()
+                };
+
+                result.push(SymbolPrice {
+                    symbol,
+                    price: current.close,
+                    change_percent,
+                    change_direction,
+                });
+            } else if let Some(price) = prices.last() {
+                result.push(SymbolPrice {
+                    symbol,
+                    price: price.close,
+                    change_percent: 0.0,
+                    change_direction: "unchanged".to_string(),
+                });
+            }
         }
     }
 
