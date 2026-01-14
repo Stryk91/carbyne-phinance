@@ -464,6 +464,17 @@
                     </div>
 
                     <div id="stocks-tab">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <span style="color: var(--text-secondary); font-size: 0.9rem;">Sort by:</span>
+                            <select id="sort-select" onchange="refreshList()" style="padding: 8px 12px;">
+                                <option value="change-desc">% Change (High to Low)</option>
+                                <option value="change-asc">% Change (Low to High)</option>
+                                <option value="price-desc">Price (High to Low)</option>
+                                <option value="price-asc">Price (Low to High)</option>
+                                <option value="symbol-asc">Symbol (A-Z)</option>
+                                <option value="symbol-desc">Symbol (Z-A)</option>
+                            </select>
+                        </div>
                         <ul class="symbol-list" id="symbol-list">
                             <li class="empty-state">No data loaded. Fetch some symbols to get started.</li>
                         </ul>
@@ -612,6 +623,27 @@
                 const list = document.getElementById('symbol-list');
 
                 if (symbols && symbols.length > 0) {
+                    // Sort symbols based on selected option
+                    const sortOption = document.getElementById('sort-select').value;
+                    symbols.sort((a, b) => {
+                        switch (sortOption) {
+                            case 'change-desc':
+                                return b.change_percent - a.change_percent;
+                            case 'change-asc':
+                                return a.change_percent - b.change_percent;
+                            case 'price-desc':
+                                return b.price - a.price;
+                            case 'price-asc':
+                                return a.price - b.price;
+                            case 'symbol-asc':
+                                return a.symbol.localeCompare(b.symbol);
+                            case 'symbol-desc':
+                                return b.symbol.localeCompare(a.symbol);
+                            default:
+                                return b.change_percent - a.change_percent;
+                        }
+                    });
+
                     list.innerHTML = symbols.map(s => {
                         const changeColor = s.change_direction === 'up' ? 'var(--success)' :
                                            s.change_direction === 'down' ? 'var(--error)' : 'var(--text-secondary)';
