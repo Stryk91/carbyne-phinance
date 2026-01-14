@@ -373,6 +373,45 @@ pub fn calculate_stochastic(
     indicators
 }
 
+/// Calculate OBV (On-Balance Volume)
+/// Cumulative volume indicator that adds volume on up days, subtracts on down days
+pub fn calculate_obv(prices: &[DailyPrice]) -> Vec<TechnicalIndicator> {
+    if prices.len() < 2 {
+        return vec![];
+    }
+
+    let mut indicators = Vec::new();
+    let mut obv: i64 = 0;
+
+    // First day - just use volume as starting point
+    obv = prices[0].volume;
+    indicators.push(TechnicalIndicator {
+        symbol: prices[0].symbol.clone(),
+        date: prices[0].date,
+        indicator_name: "OBV".to_string(),
+        value: obv as f64,
+    });
+
+    // Calculate OBV for subsequent days
+    for i in 1..prices.len() {
+        if prices[i].close > prices[i - 1].close {
+            obv += prices[i].volume; // Up day - add volume
+        } else if prices[i].close < prices[i - 1].close {
+            obv -= prices[i].volume; // Down day - subtract volume
+        }
+        // If close == prev close, OBV stays the same
+
+        indicators.push(TechnicalIndicator {
+            symbol: prices[0].symbol.clone(),
+            date: prices[i].date,
+            indicator_name: "OBV".to_string(),
+            value: obv as f64,
+        });
+    }
+
+    indicators
+}
+
 /// Calculate all standard indicators for a symbol
 pub fn calculate_all(prices: &[DailyPrice]) -> Vec<TechnicalIndicator> {
     let mut all = Vec::new();
@@ -399,6 +438,9 @@ pub fn calculate_all(prices: &[DailyPrice]) -> Vec<TechnicalIndicator> {
 
     // Stochastic 14, 3
     all.extend(calculate_stochastic(prices, 14, 3));
+
+    // OBV
+    all.extend(calculate_obv(prices));
 
     all
 }
