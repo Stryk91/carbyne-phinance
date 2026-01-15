@@ -1,6 +1,10 @@
 //! Tauri GUI backend for Financial Pipeline
 
-use financial_pipeline::{calculate_all, AlertCondition, Database, Fred, GoogleTrends, PositionType, YahooFinance};
+use financial_pipeline::{
+    calculate_all, AlertCondition, BacktestConfig, BacktestEngine, Database, Fred, GoogleTrends,
+    IndicatorAlert, IndicatorAlertCondition, IndicatorAlertType, PositionType, SignalEngine,
+    Strategy, StrategyConditionType, YahooFinance,
+};
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::State;
@@ -743,10 +747,666 @@ fn get_trends(state: State<AppState>, keyword: String) -> Result<Vec<TrendPoint>
         .collect())
 }
 
+// ============================================================================
+// Signal Commands
+// ============================================================================
+
+/// Signal data for frontend
+#[derive(Serialize)]
+struct SignalData {
+    id: i64,
+    symbol: String,
+    signal_type: String,
+    direction: String,
+    strength: f64,
+    price_at_signal: f64,
+    triggered_by: String,
+    trigger_value: f64,
+    timestamp: String,
+    created_at: String,
+    acknowledged: bool,
+}
+
+/// Generate signals for a symbol
+#[tauri::command]
+fn generate_signals(state: State<AppState>, symbol: String) -> Result<CommandResult, String> {
+    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    // Get prices and indicators
+    let prices = db.get_prices(&symbol).map_err(|e| e.to_string())?;
+    let indicators = db.get_all_indicators(&symbol).map_err(|e| e.to_string())?;
+
+    if prices.is_empty() {
+        return Ok(CommandResult {
+            success: false,
+            message: format!("No price data for {}", symbol),
+        });
+    }
+
+    if indicators.is_empty() {
+        return Ok(CommandResult {
+            success: false,
+            message: format!("No indicator data for {}. Calculate indicators first.", symbol),
+        });
+    }
+
+    // Generate signals
+    let engine = SignalEngine::new();
+    let signals = engine.generate_signals(&symbol, &indicators, &prices);
+    let count = signals.len();
+
+    // Store signals
+    db.upsert_signals(&signals).map_err(|e| e.to_string())?;
+
+    println!("[OK] Generated {} signals for {}", count, symbol);
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Generated {} signals for {}", count, symbol),
+    })
+}
+
+/// Get signals for a symbol
+#[tauri::command]
+fn get_signals(
+    state: State<AppState>,
+    symbol: String,
+    only_unacknowledged: bool,
+) -> Result<Vec<SignalData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    let signals = db
+        .get_signals(&symbol, only_unacknowledged)
+        .map_err(|e| e.to_string())?;
+
+    Ok(signals
+        .into_iter()
+        .map(|s| SignalData {
+            id: s.id,
+            symbol: s.symbol,
+            signal_type: s.signal_type.as_str().to_string(),
+            direction: s.direction.as_str().to_string(),
+            strength: s.strength,
+            price_at_signal: s.price_at_signal,
+            triggered_by: s.triggered_by,
+            trigger_value: s.trigger_value,
+            timestamp: s.timestamp.to_string(),
+            created_at: s.created_at,
+            acknowledged: s.acknowledged,
+        })
+        .collect())
+}
+
+/// Get all recent signals across all symbols
+#[tauri::command]
+fn get_all_signals(state: State<AppState>, limit: usize) -> Result<Vec<SignalData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let signals = db.get_recent_signals(limit).map_err(|e| e.to_string())?;
+
+    Ok(signals
+        .into_iter()
+        .map(|s| SignalData {
+            id: s.id,
+            symbol: s.symbol,
+            signal_type: s.signal_type.as_str().to_string(),
+            direction: s.direction.as_str().to_string(),
+            strength: s.strength,
+            price_at_signal: s.price_at_signal,
+            triggered_by: s.triggered_by,
+            trigger_value: s.trigger_value,
+            timestamp: s.timestamp.to_string(),
+            created_at: s.created_at,
+            acknowledged: s.acknowledged,
+        })
+        .collect())
+}
+
+/// Acknowledge a signal
+#[tauri::command]
+fn acknowledge_signal(state: State<AppState>, signal_id: i64) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    db.acknowledge_signal(signal_id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: "Signal acknowledged".to_string(),
+    })
+}
+
+/// Acknowledge all signals for a symbol
+#[tauri::command]
+fn acknowledge_all_signals(
+    state: State<AppState>,
+    symbol: String,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    db.acknowledge_all_signals(&symbol)
+        .map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("All signals for {} acknowledged", symbol),
+    })
+}
+
+// ============================================================================
+// Indicator Alert Commands
+// ============================================================================
+
+/// Indicator alert data for frontend
+#[derive(Serialize)]
+struct IndicatorAlertData {
+    id: i64,
+    symbol: String,
+    alert_type: String,
+    indicator_name: String,
+    secondary_indicator: Option<String>,
+    condition: String,
+    threshold: Option<f64>,
+    triggered: bool,
+    last_value: Option<f64>,
+    created_at: String,
+    message: Option<String>,
+}
+
+/// Add an indicator alert
+#[tauri::command]
+fn add_indicator_alert(
+    state: State<AppState>,
+    symbol: String,
+    alert_type: String,
+    indicator_name: String,
+    secondary_indicator: Option<String>,
+    condition: String,
+    threshold: Option<f64>,
+    message: Option<String>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    let alert_type_enum = IndicatorAlertType::from_str(&alert_type)
+        .ok_or_else(|| "Invalid alert type. Use 'threshold', 'crossover', or 'band_touch'".to_string())?;
+
+    let condition_enum = IndicatorAlertCondition::from_str(&condition)
+        .ok_or_else(|| "Invalid condition. Use 'crosses_above', 'crosses_below', 'bullish_crossover', or 'bearish_crossover'".to_string())?;
+
+    let alert = IndicatorAlert {
+        id: 0,
+        symbol: symbol.clone(),
+        alert_type: alert_type_enum,
+        indicator_name: indicator_name.clone(),
+        secondary_indicator,
+        condition: condition_enum,
+        threshold,
+        triggered: false,
+        last_value: None,
+        created_at: String::new(),
+        message,
+    };
+
+    db.add_indicator_alert(&alert).map_err(|e| e.to_string())?;
+
+    println!(
+        "[OK] Added indicator alert for {} {} {} {}",
+        symbol, indicator_name, condition, threshold.map(|t| format!("{}", t)).unwrap_or_default()
+    );
+
+    Ok(CommandResult {
+        success: true,
+        message: format!(
+            "Indicator alert set: {} {} {} {}",
+            symbol, indicator_name, condition, threshold.map(|t| format!("{}", t)).unwrap_or_default()
+        ),
+    })
+}
+
+/// Get all indicator alerts
+#[tauri::command]
+fn get_indicator_alerts(
+    state: State<AppState>,
+    only_active: bool,
+) -> Result<Vec<IndicatorAlertData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let alerts = db.get_indicator_alerts(only_active).map_err(|e| e.to_string())?;
+
+    Ok(alerts
+        .into_iter()
+        .map(|a| IndicatorAlertData {
+            id: a.id,
+            symbol: a.symbol,
+            alert_type: a.alert_type.as_str().to_string(),
+            indicator_name: a.indicator_name,
+            secondary_indicator: a.secondary_indicator,
+            condition: a.condition.as_str().to_string(),
+            threshold: a.threshold,
+            triggered: a.triggered,
+            last_value: a.last_value,
+            created_at: a.created_at,
+            message: a.message,
+        })
+        .collect())
+}
+
+/// Delete an indicator alert
+#[tauri::command]
+fn delete_indicator_alert(
+    state: State<AppState>,
+    alert_id: i64,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    db.delete_indicator_alert(alert_id).map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: "Indicator alert deleted".to_string(),
+    })
+}
+
+/// Check all indicator alerts, returns triggered alerts
+#[tauri::command]
+fn check_indicator_alerts(state: State<AppState>) -> Result<Vec<IndicatorAlertData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let triggered = db.check_indicator_alerts().map_err(|e| e.to_string())?;
+
+    Ok(triggered
+        .into_iter()
+        .map(|a| IndicatorAlertData {
+            id: a.id,
+            symbol: a.symbol,
+            alert_type: a.alert_type.as_str().to_string(),
+            indicator_name: a.indicator_name,
+            secondary_indicator: a.secondary_indicator,
+            condition: a.condition.as_str().to_string(),
+            threshold: a.threshold,
+            triggered: a.triggered,
+            last_value: a.last_value,
+            created_at: a.created_at,
+            message: a.message,
+        })
+        .collect())
+}
+
+// ============================================================================
+// Backtest Commands
+// ============================================================================
+
+/// Strategy data for frontend
+#[derive(Serialize)]
+struct StrategyData {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    entry_condition: String,
+    entry_threshold: f64,
+    exit_condition: String,
+    exit_threshold: f64,
+    stop_loss_percent: Option<f64>,
+    take_profit_percent: Option<f64>,
+    position_size_percent: f64,
+    created_at: String,
+}
+
+/// Backtest trade data for frontend
+#[derive(Serialize)]
+struct BacktestTradeData {
+    id: i64,
+    symbol: String,
+    direction: String,
+    entry_date: String,
+    entry_price: f64,
+    entry_reason: String,
+    exit_date: Option<String>,
+    exit_price: Option<f64>,
+    exit_reason: Option<String>,
+    shares: f64,
+    profit_loss: Option<f64>,
+    profit_loss_percent: Option<f64>,
+}
+
+/// Performance metrics for frontend
+#[derive(Serialize)]
+struct MetricsData {
+    total_return: f64,
+    total_return_dollars: f64,
+    max_drawdown: f64,
+    sharpe_ratio: f64,
+    win_rate: f64,
+    total_trades: usize,
+    winning_trades: usize,
+    losing_trades: usize,
+    avg_win_percent: f64,
+    avg_loss_percent: f64,
+    profit_factor: f64,
+    avg_trade_duration_days: f64,
+}
+
+/// Backtest result data for frontend
+#[derive(Serialize)]
+struct BacktestResultData {
+    id: i64,
+    strategy_id: i64,
+    strategy_name: String,
+    symbol: String,
+    start_date: String,
+    end_date: String,
+    initial_capital: f64,
+    final_capital: f64,
+    metrics: MetricsData,
+    trades: Vec<BacktestTradeData>,
+    created_at: String,
+}
+
+/// Save a strategy
+#[tauri::command]
+fn save_strategy(
+    state: State<AppState>,
+    name: String,
+    description: Option<String>,
+    entry_condition: String,
+    entry_threshold: f64,
+    exit_condition: String,
+    exit_threshold: f64,
+    stop_loss_percent: Option<f64>,
+    take_profit_percent: Option<f64>,
+    position_size_percent: f64,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let entry_cond = StrategyConditionType::from_str(&entry_condition)
+        .ok_or_else(|| format!("Invalid entry condition: {}", entry_condition))?;
+    let exit_cond = StrategyConditionType::from_str(&exit_condition)
+        .ok_or_else(|| format!("Invalid exit condition: {}", exit_condition))?;
+
+    let strategy = Strategy {
+        id: 0,
+        name: name.clone(),
+        description,
+        entry_condition: entry_cond,
+        entry_threshold,
+        exit_condition: exit_cond,
+        exit_threshold,
+        stop_loss_percent,
+        take_profit_percent,
+        position_size_percent,
+        created_at: String::new(),
+    };
+
+    db.save_strategy(&strategy).map_err(|e| e.to_string())?;
+
+    println!("[OK] Saved strategy: {}", name);
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Strategy '{}' saved", name),
+    })
+}
+
+/// Get all strategies
+#[tauri::command]
+fn get_strategies(state: State<AppState>) -> Result<Vec<StrategyData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let strategies = db.get_strategies().map_err(|e| e.to_string())?;
+
+    Ok(strategies
+        .into_iter()
+        .map(|s| StrategyData {
+            id: s.id,
+            name: s.name,
+            description: s.description,
+            entry_condition: s.entry_condition.as_str().to_string(),
+            entry_threshold: s.entry_threshold,
+            exit_condition: s.exit_condition.as_str().to_string(),
+            exit_threshold: s.exit_threshold,
+            stop_loss_percent: s.stop_loss_percent,
+            take_profit_percent: s.take_profit_percent,
+            position_size_percent: s.position_size_percent,
+            created_at: s.created_at,
+        })
+        .collect())
+}
+
+/// Delete a strategy
+#[tauri::command]
+fn delete_strategy(state: State<AppState>, name: String) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    db.delete_strategy(&name).map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Strategy '{}' deleted", name),
+    })
+}
+
+/// Run a backtest
+#[tauri::command]
+fn run_backtest(
+    state: State<AppState>,
+    strategy_name: String,
+    symbol: String,
+    initial_capital: f64,
+) -> Result<BacktestResultData, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    // Get strategy
+    let strategy = db
+        .get_strategy(&strategy_name)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Strategy '{}' not found", strategy_name))?;
+
+    // Get prices and indicators
+    let prices = db.get_prices(&symbol).map_err(|e| e.to_string())?;
+    let indicators = db.get_all_indicators(&symbol).map_err(|e| e.to_string())?;
+
+    if prices.is_empty() {
+        return Err(format!("No price data for {}", symbol));
+    }
+
+    if indicators.is_empty() {
+        return Err(format!(
+            "No indicator data for {}. Calculate indicators first.",
+            symbol
+        ));
+    }
+
+    // Run backtest
+    let config = BacktestConfig {
+        initial_capital,
+        commission_per_trade: 0.0,
+    };
+    let engine = BacktestEngine::new(config);
+    let result = engine.run(&strategy, &symbol, &prices, &indicators);
+
+    // Save result
+    db.save_backtest_result(&result).map_err(|e| e.to_string())?;
+
+    println!(
+        "[OK] Backtest completed for {} on {}: {:.2}% return",
+        strategy_name, symbol, result.metrics.total_return
+    );
+
+    // Convert to frontend format
+    Ok(BacktestResultData {
+        id: result.id,
+        strategy_id: result.strategy_id,
+        strategy_name: result.strategy_name,
+        symbol: result.symbol,
+        start_date: result.start_date.to_string(),
+        end_date: result.end_date.to_string(),
+        initial_capital: result.initial_capital,
+        final_capital: result.final_capital,
+        metrics: MetricsData {
+            total_return: result.metrics.total_return,
+            total_return_dollars: result.metrics.total_return_dollars,
+            max_drawdown: result.metrics.max_drawdown,
+            sharpe_ratio: result.metrics.sharpe_ratio,
+            win_rate: result.metrics.win_rate,
+            total_trades: result.metrics.total_trades,
+            winning_trades: result.metrics.winning_trades,
+            losing_trades: result.metrics.losing_trades,
+            avg_win_percent: result.metrics.avg_win_percent,
+            avg_loss_percent: result.metrics.avg_loss_percent,
+            profit_factor: result.metrics.profit_factor,
+            avg_trade_duration_days: result.metrics.avg_trade_duration_days,
+        },
+        trades: result
+            .trades
+            .into_iter()
+            .map(|t| BacktestTradeData {
+                id: t.id,
+                symbol: t.symbol,
+                direction: t.direction.as_str().to_string(),
+                entry_date: t.entry_date.to_string(),
+                entry_price: t.entry_price,
+                entry_reason: t.entry_reason,
+                exit_date: t.exit_date.map(|d| d.to_string()),
+                exit_price: t.exit_price,
+                exit_reason: t.exit_reason,
+                shares: t.shares,
+                profit_loss: t.profit_loss,
+                profit_loss_percent: t.profit_loss_percent,
+            })
+            .collect(),
+        created_at: result.created_at,
+    })
+}
+
+/// Get backtest history
+#[tauri::command]
+fn get_backtest_results(
+    state: State<AppState>,
+    strategy_name: Option<String>,
+    symbol: Option<String>,
+    limit: usize,
+) -> Result<Vec<BacktestResultData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let results = db
+        .get_backtest_results(
+            strategy_name.as_deref(),
+            symbol.as_deref(),
+            limit,
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(results
+        .into_iter()
+        .map(|r| BacktestResultData {
+            id: r.id,
+            strategy_id: r.strategy_id,
+            strategy_name: r.strategy_name,
+            symbol: r.symbol,
+            start_date: r.start_date.to_string(),
+            end_date: r.end_date.to_string(),
+            initial_capital: r.initial_capital,
+            final_capital: r.final_capital,
+            metrics: MetricsData {
+                total_return: r.metrics.total_return,
+                total_return_dollars: r.metrics.total_return_dollars,
+                max_drawdown: r.metrics.max_drawdown,
+                sharpe_ratio: r.metrics.sharpe_ratio,
+                win_rate: r.metrics.win_rate,
+                total_trades: r.metrics.total_trades,
+                winning_trades: r.metrics.winning_trades,
+                losing_trades: r.metrics.losing_trades,
+                avg_win_percent: r.metrics.avg_win_percent,
+                avg_loss_percent: r.metrics.avg_loss_percent,
+                profit_factor: r.metrics.profit_factor,
+                avg_trade_duration_days: r.metrics.avg_trade_duration_days,
+            },
+            trades: Vec::new(), // Trades not loaded in list view
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
+/// Get backtest detail with trades
+#[tauri::command]
+fn get_backtest_detail(
+    state: State<AppState>,
+    backtest_id: i64,
+) -> Result<Option<BacktestResultData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let result = db
+        .get_backtest_detail(backtest_id)
+        .map_err(|e| e.to_string())?;
+
+    Ok(result.map(|r| BacktestResultData {
+        id: r.id,
+        strategy_id: r.strategy_id,
+        strategy_name: r.strategy_name,
+        symbol: r.symbol,
+        start_date: r.start_date.to_string(),
+        end_date: r.end_date.to_string(),
+        initial_capital: r.initial_capital,
+        final_capital: r.final_capital,
+        metrics: MetricsData {
+            total_return: r.metrics.total_return,
+            total_return_dollars: r.metrics.total_return_dollars,
+            max_drawdown: r.metrics.max_drawdown,
+            sharpe_ratio: r.metrics.sharpe_ratio,
+            win_rate: r.metrics.win_rate,
+            total_trades: r.metrics.total_trades,
+            winning_trades: r.metrics.winning_trades,
+            losing_trades: r.metrics.losing_trades,
+            avg_win_percent: r.metrics.avg_win_percent,
+            avg_loss_percent: r.metrics.avg_loss_percent,
+            profit_factor: r.metrics.profit_factor,
+            avg_trade_duration_days: r.metrics.avg_trade_duration_days,
+        },
+        trades: r
+            .trades
+            .into_iter()
+            .map(|t| BacktestTradeData {
+                id: t.id,
+                symbol: t.symbol,
+                direction: t.direction.as_str().to_string(),
+                entry_date: t.entry_date.to_string(),
+                entry_price: t.entry_price,
+                entry_reason: t.entry_reason,
+                exit_date: t.exit_date.map(|d| d.to_string()),
+                exit_price: t.exit_price,
+                exit_reason: t.exit_reason,
+                shares: t.shares,
+                profit_loss: t.profit_loss,
+                profit_loss_percent: t.profit_loss_percent,
+            })
+            .collect(),
+        created_at: r.created_at,
+    }))
+}
+
+/// Delete a backtest result
+#[tauri::command]
+fn delete_backtest(state: State<AppState>, backtest_id: i64) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    db.delete_backtest(backtest_id).map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: "Backtest deleted".to_string(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize database
-    let db = Database::open("data/finance.db").expect("Failed to open database");
+    // Use path outside src-tauri to avoid triggering hot-reload on DB changes
+    let db = Database::open("../data/finance.db").expect("Failed to open database");
     db.init_schema().expect("Failed to initialize schema");
 
     tauri::Builder::default()
@@ -771,6 +1431,25 @@ pub fn run() {
             delete_position,
             fetch_trends,
             get_trends,
+            // Signal commands
+            generate_signals,
+            get_signals,
+            get_all_signals,
+            acknowledge_signal,
+            acknowledge_all_signals,
+            // Indicator alert commands
+            add_indicator_alert,
+            get_indicator_alerts,
+            delete_indicator_alert,
+            check_indicator_alerts,
+            // Backtest commands
+            save_strategy,
+            get_strategies,
+            delete_strategy,
+            run_backtest,
+            get_backtest_results,
+            get_backtest_detail,
+            delete_backtest,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

@@ -530,6 +530,187 @@ pub fn calculate_adx(prices: &[DailyPrice], period: usize) -> Vec<TechnicalIndic
     indicators
 }
 
+/// Calculate Williams %R
+/// Momentum indicator ranging from 0 to -100
+/// Similar to Stochastic but inverted scale
+/// Default period is 14
+pub fn calculate_williams_r(prices: &[DailyPrice], period: usize) -> Vec<TechnicalIndicator> {
+    if prices.len() < period {
+        return vec![];
+    }
+
+    let mut indicators = Vec::new();
+
+    for i in (period - 1)..prices.len() {
+        let window = &prices[(i + 1 - period)..=i];
+
+        let highest_high = window
+            .iter()
+            .map(|p| p.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lowest_low = window
+            .iter()
+            .map(|p| p.low)
+            .fold(f64::INFINITY, f64::min);
+
+        let close = prices[i].close;
+        let range = highest_high - lowest_low;
+
+        let wr = if range == 0.0 {
+            -50.0 // Neutral if no range
+        } else {
+            ((highest_high - close) / range) * -100.0
+        };
+
+        indicators.push(TechnicalIndicator {
+            symbol: prices[0].symbol.clone(),
+            date: prices[i].date,
+            indicator_name: format!("WILLR_{}", period),
+            value: wr,
+        });
+    }
+
+    indicators
+}
+
+/// Calculate CCI (Commodity Channel Index)
+/// Measures price deviation from statistical mean
+/// CCI > 100 = overbought, CCI < -100 = oversold
+/// Default period is 20
+pub fn calculate_cci(prices: &[DailyPrice], period: usize) -> Vec<TechnicalIndicator> {
+    if prices.len() < period {
+        return vec![];
+    }
+
+    let mut indicators = Vec::new();
+
+    for i in (period - 1)..prices.len() {
+        let window = &prices[(i + 1 - period)..=i];
+
+        // Calculate Typical Prices for window
+        let typical_prices: Vec<f64> = window
+            .iter()
+            .map(|p| (p.high + p.low + p.close) / 3.0)
+            .collect();
+
+        // SMA of Typical Price
+        let tp_sma: f64 = typical_prices.iter().sum::<f64>() / period as f64;
+
+        // Mean Deviation
+        let mean_dev: f64 = typical_prices
+            .iter()
+            .map(|tp| (tp - tp_sma).abs())
+            .sum::<f64>()
+            / period as f64;
+
+        // CCI = (TP - SMA(TP)) / (0.015 * Mean Deviation)
+        let current_tp = typical_prices[period - 1];
+        let cci = if mean_dev == 0.0 {
+            0.0
+        } else {
+            (current_tp - tp_sma) / (0.015 * mean_dev)
+        };
+
+        indicators.push(TechnicalIndicator {
+            symbol: prices[0].symbol.clone(),
+            date: prices[i].date,
+            indicator_name: format!("CCI_{}", period),
+            value: cci,
+        });
+    }
+
+    indicators
+}
+
+/// Calculate MFI (Money Flow Index)
+/// Volume-weighted RSI, measures buying/selling pressure
+/// MFI > 80 = overbought, MFI < 20 = oversold
+/// Default period is 14
+pub fn calculate_mfi(prices: &[DailyPrice], period: usize) -> Vec<TechnicalIndicator> {
+    if prices.len() < period + 1 {
+        return vec![];
+    }
+
+    let mut indicators = Vec::new();
+
+    // Calculate Typical Price and Raw Money Flow for each day
+    let typical_prices: Vec<f64> = prices
+        .iter()
+        .map(|p| (p.high + p.low + p.close) / 3.0)
+        .collect();
+
+    let raw_money_flows: Vec<f64> = prices
+        .iter()
+        .zip(typical_prices.iter())
+        .map(|(p, tp)| tp * p.volume as f64)
+        .collect();
+
+    // Calculate MFI for each valid period
+    for i in period..prices.len() {
+        let mut positive_mf = 0.0;
+        let mut negative_mf = 0.0;
+
+        for j in (i + 1 - period)..=i {
+            if j > 0 {
+                if typical_prices[j] > typical_prices[j - 1] {
+                    positive_mf += raw_money_flows[j];
+                } else if typical_prices[j] < typical_prices[j - 1] {
+                    negative_mf += raw_money_flows[j];
+                }
+            }
+        }
+
+        let mfi = if negative_mf == 0.0 {
+            100.0
+        } else if positive_mf == 0.0 {
+            0.0
+        } else {
+            let mfr = positive_mf / negative_mf;
+            100.0 - (100.0 / (1.0 + mfr))
+        };
+
+        indicators.push(TechnicalIndicator {
+            symbol: prices[0].symbol.clone(),
+            date: prices[i].date,
+            indicator_name: format!("MFI_{}", period),
+            value: mfi,
+        });
+    }
+
+    indicators
+}
+
+/// Calculate ROC (Rate of Change)
+/// Momentum oscillator measuring percentage change over N periods
+/// Default period is 12
+pub fn calculate_roc(prices: &[DailyPrice], period: usize) -> Vec<TechnicalIndicator> {
+    if prices.len() <= period {
+        return vec![];
+    }
+
+    let mut indicators = Vec::new();
+
+    for i in period..prices.len() {
+        let current_close = prices[i].close;
+        let past_close = prices[i - period].close;
+
+        let roc = if past_close == 0.0 {
+            0.0
+        } else {
+            ((current_close - past_close) / past_close) * 100.0
+        };
+
+        indicators.push(TechnicalIndicator {
+            symbol: prices[0].symbol.clone(),
+            date: prices[i].date,
+            indicator_name: format!("ROC_{}", period),
+            value: roc,
+        });
+    }
+
+    indicators
+}
+
 /// Calculate all standard indicators for a symbol
 pub fn calculate_all(prices: &[DailyPrice]) -> Vec<TechnicalIndicator> {
     let mut all = Vec::new();
@@ -562,6 +743,18 @@ pub fn calculate_all(prices: &[DailyPrice]) -> Vec<TechnicalIndicator> {
 
     // ADX 14
     all.extend(calculate_adx(prices, 14));
+
+    // Williams %R 14
+    all.extend(calculate_williams_r(prices, 14));
+
+    // CCI 20
+    all.extend(calculate_cci(prices, 20));
+
+    // MFI 14
+    all.extend(calculate_mfi(prices, 14));
+
+    // ROC 12
+    all.extend(calculate_roc(prices, 12));
 
     all
 }

@@ -32,6 +32,8 @@ pub mod error;
 pub mod fred;
 pub mod indicators;
 pub mod models;
+pub mod backtest;
+pub mod signals;
 pub mod trends;
 pub mod yahoo;
 
@@ -39,7 +41,18 @@ pub mod yahoo;
 pub use db::Database;
 pub use error::{PipelineError, Result};
 pub use fred::Fred;
-pub use indicators::{calculate_adx, calculate_all, calculate_atr, calculate_bollinger_bands, calculate_ema, calculate_macd, calculate_obv, calculate_rsi, calculate_sma, calculate_stochastic};
-pub use models::{AlertCondition, DailyPrice, MacroData, Position, PositionType, PriceAlert, Symbol, TechnicalIndicator, Watchlist};
+pub use indicators::{
+    calculate_adx, calculate_all, calculate_atr, calculate_bollinger_bands, calculate_cci,
+    calculate_ema, calculate_macd, calculate_mfi, calculate_obv, calculate_roc, calculate_rsi,
+    calculate_sma, calculate_stochastic, calculate_williams_r,
+};
+pub use models::{
+    AlertCondition, BacktestResult, BacktestTrade, DailyPrice, IndicatorAlert,
+    IndicatorAlertCondition, IndicatorAlertType, MacroData, PerformanceMetrics, Position,
+    PositionType, PriceAlert, Signal, SignalDirection, SignalType, Strategy,
+    StrategyConditionType, Symbol, TechnicalIndicator, TradeDirection, Watchlist,
+};
+pub use backtest::{BacktestConfig, BacktestEngine};
+pub use signals::{SignalConfig, SignalEngine};
 pub use trends::{GoogleTrends, TrendData};
 pub use yahoo::YahooFinance;

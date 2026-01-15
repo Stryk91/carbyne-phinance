@@ -23,3 +23,7 @@ tauri-plugin-log = "2"
 
 # Our financial pipeline library
 financial_pipeline = { path = "../.." }
+
+[package.metadata.tauri-cli.dev]
+# Ignore database files to prevent hot-reload when data changes
+watchIgnore = ["data/*", "*.db", "*.db-journal", "*.db-wal", "*.db-shm"]

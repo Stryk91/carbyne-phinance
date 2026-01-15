@@ -5,7 +5,12 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 
 use crate::error::Result;
-use crate::models::{AlertCondition, DailyPrice, MacroData, Position, PositionType, PriceAlert, Symbol, TechnicalIndicator};
+use crate::models::{
+    AlertCondition, BacktestResult, BacktestTrade, DailyPrice, IndicatorAlert,
+    IndicatorAlertCondition, IndicatorAlertType, MacroData, PerformanceMetrics, Position,
+    PositionType, PriceAlert, Signal, SignalDirection, SignalType, Strategy,
+    StrategyConditionType, Symbol, TechnicalIndicator, TradeDirection,
+};
 use crate::trends::TrendData;
 
 /// Database wrapper for financial data storage
@@ -603,6 +608,788 @@ impl Database {
 
         Ok(trends)
     }
+
+    // ========================================================================
+    // Signal Methods
+    // ========================================================================
+
+    /// Store a signal
+    pub fn upsert_signal(&self, signal: &Signal) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO signals
+            (symbol, signal_type, direction, strength, price_at_signal,
+             triggered_by, trigger_value, timestamp, acknowledged)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                signal.symbol,
+                signal.signal_type.as_str(),
+                signal.direction.as_str(),
+                signal.strength,
+                signal.price_at_signal,
+                signal.triggered_by,
+                signal.trigger_value,
+                signal.timestamp.to_string(),
+                signal.acknowledged,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Batch store signals
+    pub fn upsert_signals(&mut self, signals: &[Signal]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut count = 0;
+
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT OR REPLACE INTO signals
+                (symbol, signal_type, direction, strength, price_at_signal,
+                 triggered_by, trigger_value, timestamp, acknowledged)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )?;
+
+            for signal in signals {
+                stmt.execute(params![
+                    signal.symbol,
+                    signal.signal_type.as_str(),
+                    signal.direction.as_str(),
+                    signal.strength,
+                    signal.price_at_signal,
+                    signal.triggered_by,
+                    signal.trigger_value,
+                    signal.timestamp.to_string(),
+                    signal.acknowledged,
+                ])?;
+                count += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Get signals for a symbol
+    pub fn get_signals(&self, symbol: &str, only_unacknowledged: bool) -> Result<Vec<Signal>> {
+        let sql = if only_unacknowledged {
+            r#"
+            SELECT id, symbol, signal_type, direction, strength, price_at_signal,
+                   triggered_by, trigger_value, timestamp, created_at, acknowledged
+            FROM signals
+            WHERE symbol = ?1 AND acknowledged = 0
+            ORDER BY timestamp DESC
+            "#
+        } else {
+            r#"
+            SELECT id, symbol, signal_type, direction, strength, price_at_signal,
+                   triggered_by, trigger_value, timestamp, created_at, acknowledged
+            FROM signals
+            WHERE symbol = ?1
+            ORDER BY timestamp DESC
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let signals = stmt
+            .query_map(params![symbol], |row| {
+                let signal_type_str: String = row.get(2)?;
+                let direction_str: String = row.get(3)?;
+                let date_str: String = row.get(8)?;
+
+                Ok(Signal {
+                    id: row.get(0)?,
+                    symbol: row.get(1)?,
+                    signal_type: SignalType::from_str(&signal_type_str)
+                        .unwrap_or(SignalType::RsiOversold),
+                    direction: SignalDirection::from_str(&direction_str),
+                    strength: row.get(4)?,
+                    price_at_signal: row.get(5)?,
+                    triggered_by: row.get(6)?,
+                    trigger_value: row.get(7)?,
+                    timestamp: NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                    created_at: row.get(9)?,
+                    acknowledged: row.get(10)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(signals)
+    }
+
+    /// Get recent signals across all symbols
+    pub fn get_recent_signals(&self, limit: usize) -> Result<Vec<Signal>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, symbol, signal_type, direction, strength, price_at_signal,
+                   triggered_by, trigger_value, timestamp, created_at, acknowledged
+            FROM signals
+            ORDER BY timestamp DESC, strength DESC
+            LIMIT ?1
+            "#,
+        )?;
+
+        let signals = stmt
+            .query_map(params![limit as i64], |row| {
+                let signal_type_str: String = row.get(2)?;
+                let direction_str: String = row.get(3)?;
+                let date_str: String = row.get(8)?;
+
+                Ok(Signal {
+                    id: row.get(0)?,
+                    symbol: row.get(1)?,
+                    signal_type: SignalType::from_str(&signal_type_str)
+                        .unwrap_or(SignalType::RsiOversold),
+                    direction: SignalDirection::from_str(&direction_str),
+                    strength: row.get(4)?,
+                    price_at_signal: row.get(5)?,
+                    triggered_by: row.get(6)?,
+                    trigger_value: row.get(7)?,
+                    timestamp: NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                    created_at: row.get(9)?,
+                    acknowledged: row.get(10)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(signals)
+    }
+
+    /// Acknowledge a signal
+    pub fn acknowledge_signal(&self, signal_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE signals SET acknowledged = 1 WHERE id = ?1",
+            params![signal_id],
+        )?;
+        Ok(())
+    }
+
+    /// Acknowledge all signals for a symbol
+    pub fn acknowledge_all_signals(&self, symbol: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE signals SET acknowledged = 1 WHERE symbol = ?1",
+            params![symbol],
+        )?;
+        Ok(())
+    }
+
+    /// Delete old signals (cleanup)
+    pub fn cleanup_old_signals(&self, days: i64) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM signals WHERE timestamp < date('now', ?1)",
+            params![format!("-{} days", days)],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Get all indicators for a symbol (for signal generation)
+    pub fn get_all_indicators(&self, symbol: &str) -> Result<Vec<TechnicalIndicator>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT symbol, timestamp, indicator_name, value
+            FROM technical_indicators
+            WHERE symbol = ?1
+            ORDER BY timestamp ASC
+            "#,
+        )?;
+
+        let indicators = stmt
+            .query_map(params![symbol], |row| {
+                let date_str: String = row.get(1)?;
+                Ok(TechnicalIndicator {
+                    symbol: row.get(0)?,
+                    date: NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                    indicator_name: row.get(2)?,
+                    value: row.get(3)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(indicators)
+    }
+
+    // ========================================================================
+    // Indicator Alert Methods
+    // ========================================================================
+
+    /// Add an indicator alert
+    pub fn add_indicator_alert(&self, alert: &IndicatorAlert) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT INTO indicator_alerts
+            (symbol, alert_type, indicator_name, secondary_indicator, condition, threshold, message)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            params![
+                alert.symbol,
+                alert.alert_type.as_str(),
+                alert.indicator_name,
+                alert.secondary_indicator,
+                alert.condition.as_str(),
+                alert.threshold,
+                alert.message,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all indicator alerts
+    pub fn get_indicator_alerts(&self, only_active: bool) -> Result<Vec<IndicatorAlert>> {
+        let sql = if only_active {
+            r#"
+            SELECT id, symbol, alert_type, indicator_name, secondary_indicator,
+                   condition, threshold, triggered, last_value, created_at, message
+            FROM indicator_alerts
+            WHERE triggered = 0
+            ORDER BY created_at DESC
+            "#
+        } else {
+            r#"
+            SELECT id, symbol, alert_type, indicator_name, secondary_indicator,
+                   condition, threshold, triggered, last_value, created_at, message
+            FROM indicator_alerts
+            ORDER BY created_at DESC
+            "#
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let alerts = stmt
+            .query_map([], |row| {
+                let alert_type_str: String = row.get(2)?;
+                let condition_str: String = row.get(5)?;
+
+                Ok(IndicatorAlert {
+                    id: row.get(0)?,
+                    symbol: row.get(1)?,
+                    alert_type: IndicatorAlertType::from_str(&alert_type_str)
+                        .unwrap_or(IndicatorAlertType::Threshold),
+                    indicator_name: row.get(3)?,
+                    secondary_indicator: row.get(4)?,
+                    condition: IndicatorAlertCondition::from_str(&condition_str)
+                        .unwrap_or(IndicatorAlertCondition::CrossesAbove),
+                    threshold: row.get(6)?,
+                    triggered: row.get(7)?,
+                    last_value: row.get(8)?,
+                    created_at: row.get(9)?,
+                    message: row.get(10)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(alerts)
+    }
+
+    /// Delete an indicator alert
+    pub fn delete_indicator_alert(&self, alert_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM indicator_alerts WHERE id = ?1",
+            params![alert_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an indicator alert as triggered
+    pub fn trigger_indicator_alert(&self, alert_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE indicator_alerts SET triggered = 1 WHERE id = ?1",
+            params![alert_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update last_value for an indicator alert
+    pub fn update_indicator_alert_state(&self, alert_id: i64, last_value: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE indicator_alerts SET last_value = ?1 WHERE id = ?2",
+            params![last_value, alert_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the latest value for a specific indicator
+    pub fn get_latest_indicator_value(&self, symbol: &str, indicator_name: &str) -> Result<Option<f64>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT value FROM technical_indicators
+            WHERE symbol = ?1 AND indicator_name = ?2
+            ORDER BY timestamp DESC
+            LIMIT 1
+            "#,
+        )?;
+
+        let result: SqliteResult<f64> = stmt.query_row(params![symbol, indicator_name], |row| row.get(0));
+
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get the previous (second-to-last) indicator value
+    pub fn get_previous_indicator_value(&self, symbol: &str, indicator_name: &str) -> Result<Option<f64>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT value FROM technical_indicators
+            WHERE symbol = ?1 AND indicator_name = ?2
+            ORDER BY timestamp DESC
+            LIMIT 1 OFFSET 1
+            "#,
+        )?;
+
+        let result: SqliteResult<f64> = stmt.query_row(params![symbol, indicator_name], |row| row.get(0));
+
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Check all indicator alerts, returns triggered alerts
+    pub fn check_indicator_alerts(&self) -> Result<Vec<IndicatorAlert>> {
+        let alerts = self.get_indicator_alerts(true)?;
+        let mut triggered_alerts = Vec::new();
+
+        for alert in alerts {
+            let current = self.get_latest_indicator_value(&alert.symbol, &alert.indicator_name)?;
+            let previous = alert.last_value.or_else(|| {
+                self.get_previous_indicator_value(&alert.symbol, &alert.indicator_name).ok().flatten()
+            });
+
+            let Some(current_val) = current else {
+                continue;
+            };
+
+            let should_trigger = match alert.condition {
+                IndicatorAlertCondition::CrossesAbove => {
+                    if let (Some(prev), Some(threshold)) = (previous, alert.threshold) {
+                        prev < threshold && current_val >= threshold
+                    } else {
+                        false
+                    }
+                }
+                IndicatorAlertCondition::CrossesBelow => {
+                    if let (Some(prev), Some(threshold)) = (previous, alert.threshold) {
+                        prev > threshold && current_val <= threshold
+                    } else {
+                        false
+                    }
+                }
+                IndicatorAlertCondition::BullishCrossover => {
+                    if let Some(secondary) = &alert.secondary_indicator {
+                        let secondary_current = self.get_latest_indicator_value(&alert.symbol, secondary)?;
+                        let secondary_prev = self.get_previous_indicator_value(&alert.symbol, secondary)?;
+
+                        match (previous, secondary_current, secondary_prev) {
+                            (Some(prev_primary), Some(curr_sec), Some(prev_sec)) => {
+                                prev_primary <= prev_sec && current_val > curr_sec
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+                IndicatorAlertCondition::BearishCrossover => {
+                    if let Some(secondary) = &alert.secondary_indicator {
+                        let secondary_current = self.get_latest_indicator_value(&alert.symbol, secondary)?;
+                        let secondary_prev = self.get_previous_indicator_value(&alert.symbol, secondary)?;
+
+                        match (previous, secondary_current, secondary_prev) {
+                            (Some(prev_primary), Some(curr_sec), Some(prev_sec)) => {
+                                prev_primary >= prev_sec && current_val < curr_sec
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_trigger {
+                self.trigger_indicator_alert(alert.id)?;
+                triggered_alerts.push(IndicatorAlert {
+                    triggered: true,
+                    ..alert
+                });
+            } else {
+                // Update last_value for next check
+                self.update_indicator_alert_state(alert.id, current_val)?;
+            }
+        }
+
+        Ok(triggered_alerts)
+    }
+
+    // ========================================================================
+    // Backtest Methods
+    // ========================================================================
+
+    /// Save a strategy
+    pub fn save_strategy(&self, strategy: &Strategy) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO strategies
+            (name, description, entry_condition, entry_threshold,
+             exit_condition, exit_threshold,
+             stop_loss_percent, take_profit_percent, position_size_percent)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                strategy.name,
+                strategy.description,
+                strategy.entry_condition.as_str(),
+                strategy.entry_threshold,
+                strategy.exit_condition.as_str(),
+                strategy.exit_threshold,
+                strategy.stop_loss_percent,
+                strategy.take_profit_percent,
+                strategy.position_size_percent,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get all strategies
+    pub fn get_strategies(&self) -> Result<Vec<Strategy>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, name, description, entry_condition, entry_threshold,
+                   exit_condition, exit_threshold,
+                   stop_loss_percent, take_profit_percent, position_size_percent, created_at
+            FROM strategies
+            ORDER BY name ASC
+            "#,
+        )?;
+
+        let strategies = stmt
+            .query_map([], |row| {
+                let entry_cond_str: String = row.get(3)?;
+                let exit_cond_str: String = row.get(5)?;
+
+                Ok(Strategy {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    entry_condition: StrategyConditionType::from_str(&entry_cond_str)
+                        .unwrap_or(StrategyConditionType::RsiOversold),
+                    entry_threshold: row.get(4)?,
+                    exit_condition: StrategyConditionType::from_str(&exit_cond_str)
+                        .unwrap_or(StrategyConditionType::RsiOverbought),
+                    exit_threshold: row.get(6)?,
+                    stop_loss_percent: row.get(7)?,
+                    take_profit_percent: row.get(8)?,
+                    position_size_percent: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(strategies)
+    }
+
+    /// Get a strategy by name
+    pub fn get_strategy(&self, name: &str) -> Result<Option<Strategy>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, name, description, entry_condition, entry_threshold,
+                   exit_condition, exit_threshold,
+                   stop_loss_percent, take_profit_percent, position_size_percent, created_at
+            FROM strategies
+            WHERE name = ?1
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![name], |row| {
+            let entry_cond_str: String = row.get(3)?;
+            let exit_cond_str: String = row.get(5)?;
+
+            Ok(Strategy {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                entry_condition: StrategyConditionType::from_str(&entry_cond_str)
+                    .unwrap_or(StrategyConditionType::RsiOversold),
+                entry_threshold: row.get(4)?,
+                exit_condition: StrategyConditionType::from_str(&exit_cond_str)
+                    .unwrap_or(StrategyConditionType::RsiOverbought),
+                exit_threshold: row.get(6)?,
+                stop_loss_percent: row.get(7)?,
+                take_profit_percent: row.get(8)?,
+                position_size_percent: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        });
+
+        match result {
+            Ok(strategy) => Ok(Some(strategy)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a strategy
+    pub fn delete_strategy(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM strategies WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// Save a backtest result
+    pub fn save_backtest_result(&self, result: &BacktestResult) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Insert the backtest run
+        tx.execute(
+            r#"
+            INSERT INTO backtest_runs
+            (strategy_id, strategy_name, symbol, start_date, end_date,
+             initial_capital, final_capital, total_return, total_return_dollars,
+             max_drawdown, sharpe_ratio, win_rate, total_trades, winning_trades,
+             losing_trades, avg_win_percent, avg_loss_percent, profit_factor,
+             avg_trade_duration_days)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            "#,
+            params![
+                result.strategy_id,
+                result.strategy_name,
+                result.symbol,
+                result.start_date.to_string(),
+                result.end_date.to_string(),
+                result.initial_capital,
+                result.final_capital,
+                result.metrics.total_return,
+                result.metrics.total_return_dollars,
+                result.metrics.max_drawdown,
+                result.metrics.sharpe_ratio,
+                result.metrics.win_rate,
+                result.metrics.total_trades as i64,
+                result.metrics.winning_trades as i64,
+                result.metrics.losing_trades as i64,
+                result.metrics.avg_win_percent,
+                result.metrics.avg_loss_percent,
+                result.metrics.profit_factor,
+                result.metrics.avg_trade_duration_days,
+            ],
+        )?;
+
+        let backtest_id = tx.last_insert_rowid();
+
+        // Insert trades
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO backtest_trades
+                (backtest_id, symbol, direction, entry_date, entry_price, entry_reason,
+                 exit_date, exit_price, exit_reason, shares, profit_loss, profit_loss_percent)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+            )?;
+
+            for trade in &result.trades {
+                stmt.execute(params![
+                    backtest_id,
+                    trade.symbol,
+                    trade.direction.as_str(),
+                    trade.entry_date.to_string(),
+                    trade.entry_price,
+                    trade.entry_reason,
+                    trade.exit_date.map(|d| d.to_string()),
+                    trade.exit_price,
+                    trade.exit_reason,
+                    trade.shares,
+                    trade.profit_loss,
+                    trade.profit_loss_percent,
+                ])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(backtest_id)
+    }
+
+    /// Get backtest history
+    pub fn get_backtest_results(
+        &self,
+        strategy_name: Option<&str>,
+        symbol: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BacktestResult>> {
+        let mut sql = String::from(
+            r#"
+            SELECT id, strategy_id, strategy_name, symbol, start_date, end_date,
+                   initial_capital, final_capital, total_return, total_return_dollars,
+                   max_drawdown, sharpe_ratio, win_rate, total_trades, winning_trades,
+                   losing_trades, avg_win_percent, avg_loss_percent, profit_factor,
+                   avg_trade_duration_days, created_at
+            FROM backtest_runs
+            WHERE 1=1
+            "#,
+        );
+
+        if strategy_name.is_some() {
+            sql.push_str(" AND strategy_name = ?1");
+        }
+        if symbol.is_some() {
+            sql.push_str(if strategy_name.is_some() {
+                " AND symbol = ?2"
+            } else {
+                " AND symbol = ?1"
+            });
+        }
+
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let results: Vec<BacktestResult> = match (strategy_name, symbol) {
+            (Some(strat), Some(sym)) => {
+                stmt.query_map(params![strat, sym, limit as i64], |row| self.map_backtest_row(row))?
+                    .collect::<SqliteResult<Vec<_>>>()?
+            }
+            (Some(strat), None) => {
+                stmt.query_map(params![strat, limit as i64], |row| self.map_backtest_row(row))?
+                    .collect::<SqliteResult<Vec<_>>>()?
+            }
+            (None, Some(sym)) => {
+                stmt.query_map(params![sym, limit as i64], |row| self.map_backtest_row(row))?
+                    .collect::<SqliteResult<Vec<_>>>()?
+            }
+            (None, None) => {
+                stmt.query_map(params![limit as i64], |row| self.map_backtest_row(row))?
+                    .collect::<SqliteResult<Vec<_>>>()?
+            }
+        };
+
+        Ok(results)
+    }
+
+    fn map_backtest_row(&self, row: &rusqlite::Row) -> SqliteResult<BacktestResult> {
+        let start_str: String = row.get(4)?;
+        let end_str: String = row.get(5)?;
+        let total_trades_i64: i64 = row.get(13)?;
+        let winning_trades_i64: i64 = row.get(14)?;
+        let losing_trades_i64: i64 = row.get(15)?;
+
+        Ok(BacktestResult {
+            id: row.get(0)?,
+            strategy_id: row.get(1)?,
+            strategy_name: row.get(2)?,
+            symbol: row.get(3)?,
+            start_date: NaiveDate::parse_from_str(&start_str, "%Y-%m-%d")
+                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+            end_date: NaiveDate::parse_from_str(&end_str, "%Y-%m-%d")
+                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+            initial_capital: row.get(6)?,
+            final_capital: row.get(7)?,
+            metrics: PerformanceMetrics {
+                total_return: row.get(8)?,
+                total_return_dollars: row.get(9)?,
+                max_drawdown: row.get(10)?,
+                sharpe_ratio: row.get(11)?,
+                win_rate: row.get(12)?,
+                total_trades: total_trades_i64 as usize,
+                winning_trades: winning_trades_i64 as usize,
+                losing_trades: losing_trades_i64 as usize,
+                avg_win_percent: row.get(16)?,
+                avg_loss_percent: row.get(17)?,
+                profit_factor: row.get(18)?,
+                avg_trade_duration_days: row.get(19)?,
+            },
+            trades: Vec::new(), // Trades loaded separately if needed
+            created_at: row.get(20)?,
+        })
+    }
+
+    /// Get backtest detail with trades
+    pub fn get_backtest_detail(&self, backtest_id: i64) -> Result<Option<BacktestResult>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, strategy_id, strategy_name, symbol, start_date, end_date,
+                   initial_capital, final_capital, total_return, total_return_dollars,
+                   max_drawdown, sharpe_ratio, win_rate, total_trades, winning_trades,
+                   losing_trades, avg_win_percent, avg_loss_percent, profit_factor,
+                   avg_trade_duration_days, created_at
+            FROM backtest_runs
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![backtest_id], |row| self.map_backtest_row(row));
+
+        let mut backtest = match result {
+            Ok(b) => b,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Load trades
+        let mut trade_stmt = self.conn.prepare(
+            r#"
+            SELECT id, backtest_id, symbol, direction, entry_date, entry_price, entry_reason,
+                   exit_date, exit_price, exit_reason, shares, profit_loss, profit_loss_percent
+            FROM backtest_trades
+            WHERE backtest_id = ?1
+            ORDER BY entry_date ASC
+            "#,
+        )?;
+
+        let trades = trade_stmt
+            .query_map(params![backtest_id], |row| {
+                let dir_str: String = row.get(3)?;
+                let entry_str: String = row.get(4)?;
+                let exit_str: Option<String> = row.get(7)?;
+
+                Ok(BacktestTrade {
+                    id: row.get(0)?,
+                    backtest_id: row.get(1)?,
+                    symbol: row.get(2)?,
+                    direction: TradeDirection::from_str(&dir_str),
+                    entry_date: NaiveDate::parse_from_str(&entry_str, "%Y-%m-%d")
+                        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                    entry_price: row.get(5)?,
+                    entry_reason: row.get(6)?,
+                    exit_date: exit_str.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()),
+                    exit_price: row.get(8)?,
+                    exit_reason: row.get(9)?,
+                    shares: row.get(10)?,
+                    profit_loss: row.get(11)?,
+                    profit_loss_percent: row.get(12)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        backtest.trades = trades;
+
+        Ok(Some(backtest))
+    }
+
+    /// Delete a backtest result and its trades
+    pub fn delete_backtest(&self, backtest_id: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM backtest_trades WHERE backtest_id = ?1",
+            params![backtest_id],
+        )?;
+        tx.execute(
+            "DELETE FROM backtest_runs WHERE id = ?1",
+            params![backtest_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 /// Database schema SQL
@@ -758,4 +1545,114 @@ CREATE TABLE IF NOT EXISTS trends_data (
 
 CREATE INDEX IF NOT EXISTS idx_trends_keyword ON trends_data(keyword);
 CREATE INDEX IF NOT EXISTS idx_trends_date ON trends_data(date);
+
+-- Trading signals
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('bullish', 'bearish', 'neutral')),
+    strength REAL NOT NULL CHECK(strength >= 0.0 AND strength <= 1.0),
+    price_at_signal REAL NOT NULL,
+    triggered_by TEXT NOT NULL,
+    trigger_value REAL NOT NULL,
+    timestamp DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    acknowledged BOOLEAN DEFAULT 0,
+    UNIQUE(symbol, signal_type, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(signal_type);
+CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
+CREATE INDEX IF NOT EXISTS idx_signals_direction ON signals(direction);
+CREATE INDEX IF NOT EXISTS idx_signals_acknowledged ON signals(acknowledged);
+
+-- Indicator-based alerts
+CREATE TABLE IF NOT EXISTS indicator_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    alert_type TEXT NOT NULL CHECK(alert_type IN ('threshold', 'crossover', 'band_touch')),
+    indicator_name TEXT NOT NULL,
+    secondary_indicator TEXT,
+    condition TEXT NOT NULL CHECK(condition IN (
+        'crosses_above', 'crosses_below', 'bullish_crossover', 'bearish_crossover'
+    )),
+    threshold REAL,
+    triggered BOOLEAN DEFAULT 0,
+    last_value REAL,
+    message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_ind_alerts_symbol ON indicator_alerts(symbol);
+CREATE INDEX IF NOT EXISTS idx_ind_alerts_triggered ON indicator_alerts(triggered);
+
+-- Backtesting strategies
+CREATE TABLE IF NOT EXISTS strategies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    description TEXT,
+    entry_condition TEXT NOT NULL,
+    entry_threshold REAL NOT NULL,
+    exit_condition TEXT NOT NULL,
+    exit_threshold REAL NOT NULL,
+    stop_loss_percent REAL,
+    take_profit_percent REAL,
+    position_size_percent REAL NOT NULL DEFAULT 100.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategies_name ON strategies(name);
+
+-- Backtest runs
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id INTEGER NOT NULL,
+    strategy_name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    initial_capital REAL NOT NULL,
+    final_capital REAL NOT NULL,
+    total_return REAL NOT NULL,
+    total_return_dollars REAL NOT NULL,
+    max_drawdown REAL NOT NULL,
+    sharpe_ratio REAL NOT NULL,
+    win_rate REAL NOT NULL,
+    total_trades INTEGER NOT NULL,
+    winning_trades INTEGER NOT NULL,
+    losing_trades INTEGER NOT NULL,
+    avg_win_percent REAL NOT NULL,
+    avg_loss_percent REAL NOT NULL,
+    profit_factor REAL NOT NULL,
+    avg_trade_duration_days REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (strategy_id) REFERENCES strategies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy ON backtest_runs(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol ON backtest_runs(symbol);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_date ON backtest_runs(created_at);
+
+-- Backtest trades
+CREATE TABLE IF NOT EXISTS backtest_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    backtest_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK(direction IN ('long', 'short')),
+    entry_date DATE NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_reason TEXT NOT NULL,
+    exit_date DATE,
+    exit_price REAL,
+    exit_reason TEXT,
+    shares REAL NOT NULL,
+    profit_loss REAL,
+    profit_loss_percent REAL,
+    FOREIGN KEY (backtest_id) REFERENCES backtest_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(backtest_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_symbol ON backtest_trades(symbol);
 "#;
