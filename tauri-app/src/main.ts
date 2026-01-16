@@ -3,10 +3,45 @@ import './styles.css';
 import * as api from './api';
 import { TradingViewChart, IndicatorChart } from './chart';
 
+// S&P 100 Symbol List (OEX constituents)
+const SP100_SYMBOLS = [
+    'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'AIG', 'AMD', 'AMGN', 'AMT', 'AMZN',
+    'AVGO', 'AXP', 'BA', 'BAC', 'BK', 'BKNG', 'BLK', 'BMY', 'BRK.B', 'C',
+    'CAT', 'CHTR', 'CL', 'CMCSA', 'COF', 'COP', 'COST', 'CRM', 'CSCO', 'CVS',
+    'CVX', 'DE', 'DHR', 'DIS', 'DOW', 'DUK', 'EMR', 'EXC', 'F', 'FDX',
+    'GD', 'GE', 'GILD', 'GM', 'GOOG', 'GOOGL', 'GS', 'HD', 'HON', 'IBM',
+    'INTC', 'JNJ', 'JPM', 'KHC', 'KO', 'LIN', 'LLY', 'LMT', 'LOW', 'MA',
+    'MCD', 'MDLZ', 'MDT', 'MET', 'META', 'MMM', 'MO', 'MRK', 'MS', 'MSFT',
+    'NEE', 'NFLX', 'NKE', 'NVDA', 'ORCL', 'PEP', 'PFE', 'PG', 'PM', 'PYPL',
+    'QCOM', 'RTX', 'SBUX', 'SCHW', 'SO', 'SPG', 'T', 'TGT', 'TMO', 'TMUS',
+    'TSLA', 'TXN', 'UNH', 'UNP', 'UPS', 'USB', 'V', 'VZ', 'WFC', 'WMT', 'XOM'
+];
+
+// ASX 100 Symbol List (with .AX suffix for Yahoo Finance)
+const ASX100_SYMBOLS = [
+    'BHP.AX', 'CBA.AX', 'CSL.AX', 'NAB.AX', 'WBC.AX', 'ANZ.AX', 'WES.AX', 'MQG.AX', 'FMG.AX', 'WDS.AX',
+    'TLS.AX', 'RIO.AX', 'WOW.AX', 'GMG.AX', 'TCL.AX', 'STO.AX', 'ALL.AX', 'QBE.AX', 'REA.AX', 'COL.AX',
+    'SUN.AX', 'JHX.AX', 'RMD.AX', 'NCM.AX', 'AMC.AX', 'IAG.AX', 'ORG.AX', 'AGL.AX', 'S32.AX', 'APA.AX',
+    'MIN.AX', 'XRO.AX', 'TWE.AX', 'ASX.AX', 'CPU.AX', 'QAN.AX', 'SHL.AX', 'SOL.AX', 'AZJ.AX', 'DXS.AX',
+    'FPH.AX', 'GPT.AX', 'SCG.AX', 'SEK.AX', 'MPL.AX', 'ORI.AX', 'EVN.AX', 'NST.AX', 'ILU.AX', 'ALQ.AX',
+    'ALD.AX', 'JBH.AX', 'COH.AX', 'OZL.AX', 'WHC.AX', 'CTX.AX', 'EDV.AX', 'NHF.AX', 'BXB.AX', 'SVW.AX',
+    'BEN.AX', 'MGR.AX', 'VCX.AX', 'BSL.AX', 'SDF.AX', 'LLC.AX', 'CAR.AX', 'IGO.AX', 'AMP.AX', 'NEC.AX',
+    'WOR.AX', 'REH.AX', 'CCL.AX', 'BOQ.AX', 'TAH.AX', 'HVN.AX', 'ALU.AX', 'IPL.AX', 'NWS.AX', 'SGP.AX',
+    'FLT.AX', 'PME.AX', 'CWN.AX', 'PLS.AX', 'LYC.AX', 'AWC.AX', 'WEB.AX', 'CGF.AX', 'SFR.AX', 'PDN.AX',
+    'NXT.AX', 'VEA.AX', 'IEL.AX', 'APE.AX', 'HUB.AX', 'TLC.AX', 'WTC.AX', 'CCP.AX', 'LNK.AX', 'ABC.AX'
+];
+
+// LocalStorage keys
+const STORAGE_KEYS = {
+    AUTO_REFRESH_ENABLED: 'fp_auto_refresh_enabled',
+    AUTO_REFRESH_INTERVAL: 'fp_auto_refresh_interval',
+};
+
 // State
 let tvChart: TradingViewChart | null = null;
 let indicatorChart: IndicatorChart | null = null;
 let autoRefreshTimer: number | null = null;
+let selectedGroupName: string | null = null;
 
 // Logger
 function log(message: string, type: 'info' | 'success' | 'error' = 'info'): void {
@@ -41,6 +76,7 @@ function switchTab(tabName: string): void {
     if (tabName === 'macro') loadMacroData();
     if (tabName === 'chart') initializeChart();
     if (tabName === 'indicators') initializeIndicatorChart();
+    if (tabName === 'groups') loadGroups();
 }
 
 // Initialize TradingView chart
@@ -98,10 +134,15 @@ async function refreshSymbolList(): Promise<void> {
                 const changeSign = s.change_percent >= 0 ? '+' : '';
                 const arrow = s.change_direction === 'up' ? '▲' :
                              s.change_direction === 'down' ? '▼' : '';
+                const favText = s.favorited ? '🌙' : '☽';
+                const favClass = s.favorited ? 'favorited' : '';
 
                 return `
                     <li class="symbol-item" data-symbol="${s.symbol}">
-                        <span class="symbol-ticker">${s.symbol}</span>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <button class="favorite-toggle ${favClass}" data-symbol="${s.symbol}" title="Toggle auto-refresh">${favText}</button>
+                            <span class="symbol-ticker">${s.symbol}</span>
+                        </div>
                         <div>
                             <span class="symbol-price ${changeColor}">$${s.price.toFixed(2)}</span>
                             <span class="${changeColor}" style="margin-left: 8px;">
@@ -366,6 +407,46 @@ async function addPosition(): Promise<void> {
     }
 }
 
+// Toggle favorite button helper
+async function toggleFavoriteButton(buttonId: string, symbol: string): Promise<void> {
+    const btn = document.getElementById(buttonId);
+    if (!btn) return;
+
+    try {
+        const newState = await api.toggleFavorite(symbol);
+        btn.textContent = newState ? 'FAV ★' : 'FAV';
+        btn.classList.toggle('favorited', newState);
+        log(`${symbol} ${newState ? 'added to' : 'removed from'} auto-refresh`, 'info');
+        // Refresh symbol list to update moon icons
+        await refreshSymbolList();
+    } catch (error) {
+        log(`Error toggling favorite: ${error}`, 'error');
+    }
+}
+
+// Update favorite button state when symbol input changes
+async function updateFavoriteButtonState(inputId: string, buttonId: string): Promise<void> {
+    const input = document.getElementById(inputId) as HTMLInputElement;
+    const btn = document.getElementById(buttonId);
+    if (!input || !btn) return;
+
+    const symbol = input.value.trim().toUpperCase();
+    if (!symbol) {
+        btn.textContent = 'FAV';
+        btn.classList.remove('favorited');
+        return;
+    }
+
+    try {
+        const favorites = await api.getFavoritedSymbols();
+        const isFavorited = favorites.includes(symbol);
+        btn.textContent = isFavorited ? 'FAV ★' : 'FAV';
+        btn.classList.toggle('favorited', isFavorited);
+    } catch {
+        // Ignore errors
+    }
+}
+
 // Search
 async function searchCompany(query: string): Promise<void> {
     const resultsDiv = document.getElementById('search-results');
@@ -388,14 +469,311 @@ async function searchCompany(query: string): Promise<void> {
     }
 }
 
+// Symbol Groups / Watchlists
+async function loadGroups(): Promise<void> {
+    try {
+        log('Loading symbol groups...', 'info');
+        const groups = await api.getAllWatchlists();
+        const list = document.getElementById('groups-list');
+
+        if (!list) return;
+
+        if (groups && groups.length > 0) {
+            list.innerHTML = groups.map(g => `
+                <li class="symbol-item group-item" data-group="${g.name}">
+                    <div>
+                        <span class="symbol-ticker">${g.name}</span>
+                        <span style="color: var(--text-secondary); margin-left: 10px; font-size: 0.85rem;">
+                            ${g.symbol_count} symbols
+                        </span>
+                    </div>
+                    <div style="color: var(--text-secondary); font-size: 0.8rem;">
+                        ${g.description || ''}
+                    </div>
+                </li>
+            `).join('');
+            log(`Loaded ${groups.length} symbol groups`, 'success');
+        } else {
+            list.innerHTML = '<li class="empty-state">No groups created. Create your first symbol group.</li>';
+        }
+    } catch (error) {
+        log(`Error loading groups: ${error}`, 'error');
+    }
+}
+
+async function createGroup(): Promise<void> {
+    const name = (document.getElementById('group-name') as HTMLInputElement).value.trim();
+    const symbolsInput = (document.getElementById('group-symbols') as HTMLInputElement).value.trim();
+    const description = (document.getElementById('group-description') as HTMLInputElement).value.trim() || null;
+
+    if (!name) {
+        alert('Please enter a group name');
+        return;
+    }
+
+    const symbols = symbolsInput
+        .split(',')
+        .map(s => s.trim().toUpperCase())
+        .filter(s => s.length > 0);
+
+    if (symbols.length === 0) {
+        alert('Please enter at least one symbol');
+        return;
+    }
+
+    try {
+        log(`Creating group "${name}" with ${symbols.length} symbols...`, 'info');
+        const result = await api.createWatchlist(name, symbols, description);
+        log(result.message, result.success ? 'success' : 'error');
+        alert(result.message);
+
+        if (result.success) {
+            // Clear form
+            (document.getElementById('group-name') as HTMLInputElement).value = '';
+            (document.getElementById('group-symbols') as HTMLInputElement).value = '';
+            (document.getElementById('group-description') as HTMLInputElement).value = '';
+            await loadGroups();
+        }
+    } catch (error) {
+        log(`Error creating group: ${error}`, 'error');
+        alert(`Error: ${error}`);
+    }
+}
+
+async function loadGroupDetail(groupName: string): Promise<void> {
+    try {
+        const detail = await api.getWatchlistDetail(groupName);
+        const detailDiv = document.getElementById('group-detail');
+        const symbolsList = document.getElementById('group-symbols-list');
+
+        if (!detail || !detailDiv || !symbolsList) {
+            if (detailDiv) detailDiv.style.display = 'none';
+            return;
+        }
+
+        selectedGroupName = groupName;
+        detailDiv.style.display = 'block';
+        document.getElementById('group-detail-name')!.textContent = detail.name;
+        document.getElementById('group-detail-desc')!.textContent = detail.description || '';
+
+        if (detail.symbols.length > 0) {
+            symbolsList.innerHTML = detail.symbols.map(s => `
+                <li class="symbol-item group-symbol-item" data-symbol="${s}">
+                    <span class="symbol-ticker">${s}</span>
+                    <button class="btn-secondary remove-symbol-btn" data-symbol="${s}" style="padding: 4px 8px; font-size: 0.75rem; background: var(--error);">
+                        Remove
+                    </button>
+                </li>
+            `).join('');
+        } else {
+            symbolsList.innerHTML = '<li class="empty-state">No symbols in this group.</li>';
+        }
+
+        // Highlight selected group
+        document.querySelectorAll('.group-item').forEach(item => {
+            item.classList.toggle('selected', item.getAttribute('data-group') === groupName);
+        });
+
+        log(`Loaded group "${groupName}" with ${detail.symbols.length} symbols`, 'success');
+    } catch (error) {
+        log(`Error loading group detail: ${error}`, 'error');
+    }
+}
+
+async function addSymbolToGroup(): Promise<void> {
+    if (!selectedGroupName) {
+        alert('Please select a group first');
+        return;
+    }
+
+    const symbol = (document.getElementById('add-symbol-input') as HTMLInputElement).value.trim().toUpperCase();
+    if (!symbol) {
+        alert('Please enter a symbol');
+        return;
+    }
+
+    try {
+        log(`Adding ${symbol} to "${selectedGroupName}"...`, 'info');
+        const result = await api.addSymbolToWatchlist(selectedGroupName, symbol);
+        log(result.message, result.success ? 'success' : 'error');
+
+        if (result.success) {
+            (document.getElementById('add-symbol-input') as HTMLInputElement).value = '';
+            await loadGroupDetail(selectedGroupName);
+            await loadGroups(); // Update count
+        } else {
+            alert(result.message);
+        }
+    } catch (error) {
+        log(`Error adding symbol: ${error}`, 'error');
+        alert(`Error: ${error}`);
+    }
+}
+
+async function removeSymbolFromGroup(symbol: string): Promise<void> {
+    if (!selectedGroupName) return;
+
+    try {
+        log(`Removing ${symbol} from "${selectedGroupName}"...`, 'info');
+        const result = await api.removeSymbolFromWatchlist(selectedGroupName, symbol);
+        log(result.message, result.success ? 'success' : 'error');
+
+        if (result.success) {
+            await loadGroupDetail(selectedGroupName);
+            await loadGroups(); // Update count
+        }
+    } catch (error) {
+        log(`Error removing symbol: ${error}`, 'error');
+    }
+}
+
+async function deleteGroup(): Promise<void> {
+    if (!selectedGroupName) return;
+
+    if (!confirm(`Are you sure you want to delete the group "${selectedGroupName}"?`)) {
+        return;
+    }
+
+    try {
+        log(`Deleting group "${selectedGroupName}"...`, 'info');
+        const result = await api.deleteWatchlist(selectedGroupName);
+        log(result.message, result.success ? 'success' : 'error');
+
+        if (result.success) {
+            selectedGroupName = null;
+            document.getElementById('group-detail')!.style.display = 'none';
+            await loadGroups();
+        } else {
+            alert(result.message);
+        }
+    } catch (error) {
+        log(`Error deleting group: ${error}`, 'error');
+        alert(`Error: ${error}`);
+    }
+}
+
+async function fetchGroupPrices(): Promise<void> {
+    if (!selectedGroupName) return;
+
+    try {
+        const detail = await api.getWatchlistDetail(selectedGroupName);
+        if (!detail || detail.symbols.length === 0) {
+            alert('No symbols in this group');
+            return;
+        }
+
+        const period = (document.getElementById('period') as HTMLSelectElement).value;
+        log(`Fetching prices for group "${selectedGroupName}" (${detail.symbols.length} symbols)...`, 'info');
+
+        // Fetch in smaller batches for stability
+        const batchSize = 5;
+        for (let i = 0; i < detail.symbols.length; i += batchSize) {
+            const batch = detail.symbols.slice(i, i + batchSize).join(',');
+            try {
+                await api.fetchPrices(batch, period);
+                log(`Fetched batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(detail.symbols.length / batchSize)}`, 'info');
+            } catch (error) {
+                log(`Error fetching batch: ${error}`, 'error');
+            }
+        }
+
+        log(`Finished fetching ${detail.symbols.length} symbols for group "${selectedGroupName}"`, 'success');
+        alert(`Fetched prices for ${detail.symbols.length} symbols in "${selectedGroupName}"`);
+        await refreshSymbolList();
+    } catch (error) {
+        log(`Error fetching group prices: ${error}`, 'error');
+        alert(`Error: ${error}`);
+    }
+}
+
+async function createPresetGroup(name: string, symbolsStr: string, description: string): Promise<void> {
+    const symbols = symbolsStr.split(',').map(s => s.trim().toUpperCase());
+
+    try {
+        log(`Creating preset group "${name}"...`, 'info');
+        const result = await api.createWatchlist(name, symbols, description);
+        log(result.message, result.success ? 'success' : 'error');
+
+        if (result.success) {
+            await loadGroups();
+            alert(`Created group "${name}" with ${symbols.length} symbols`);
+        } else {
+            alert(result.message);
+        }
+    } catch (error) {
+        log(`Error creating preset group: ${error}`, 'error');
+        alert(`Error: ${error}`);
+    }
+}
+
+// Fetch S&P 100
+async function fetchSP100(): Promise<void> {
+    const period = (document.getElementById('period') as HTMLSelectElement).value;
+    log(`Fetching S&P 100 (${SP100_SYMBOLS.length} symbols)...`, 'info');
+
+    // Fetch in smaller batches for stability
+    const batchSize = 5;
+    for (let i = 0; i < SP100_SYMBOLS.length; i += batchSize) {
+        const batch = SP100_SYMBOLS.slice(i, i + batchSize).join(',');
+        try {
+            await api.fetchPrices(batch, period);
+            log(`Fetched batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(SP100_SYMBOLS.length / batchSize)}`, 'info');
+        } catch (error) {
+            log(`Error fetching batch: ${error}`, 'error');
+        }
+    }
+
+    log(`S&P 100 fetch complete`, 'success');
+    alert('S&P 100 symbols fetched!');
+    await refreshSymbolList();
+}
+
+// Fetch ASX 100
+async function fetchASX100(): Promise<void> {
+    const period = (document.getElementById('period') as HTMLSelectElement).value;
+    log(`Fetching ASX 100 (${ASX100_SYMBOLS.length} symbols)...`, 'info');
+
+    // Fetch in smaller batches for stability
+    const batchSize = 5;
+    for (let i = 0; i < ASX100_SYMBOLS.length; i += batchSize) {
+        const batch = ASX100_SYMBOLS.slice(i, i + batchSize).join(',');
+        try {
+            await api.fetchPrices(batch, period);
+            log(`Fetched batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(ASX100_SYMBOLS.length / batchSize)}`, 'info');
+        } catch (error) {
+            log(`Error fetching batch: ${error}`, 'error');
+        }
+    }
+
+    log(`ASX 100 fetch complete`, 'success');
+    alert('ASX 100 symbols fetched!');
+    await refreshSymbolList();
+}
+
 // Auto-refresh
 function updateLastRefreshTime(): void {
     const now = new Date();
     document.getElementById('last-refresh')!.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function saveAutoRefreshState(enabled: boolean, interval: number): void {
+    localStorage.setItem(STORAGE_KEYS.AUTO_REFRESH_ENABLED, JSON.stringify(enabled));
+    localStorage.setItem(STORAGE_KEYS.AUTO_REFRESH_INTERVAL, JSON.stringify(interval));
+}
+
+function loadAutoRefreshState(): { enabled: boolean; interval: number } {
+    const enabled = localStorage.getItem(STORAGE_KEYS.AUTO_REFRESH_ENABLED);
+    const interval = localStorage.getItem(STORAGE_KEYS.AUTO_REFRESH_INTERVAL);
+
+    return {
+        enabled: enabled ? JSON.parse(enabled) : false,
+        interval: interval ? JSON.parse(interval) : 300000, // default 5 min
+    };
+}
+
 function toggleAutoRefresh(): void {
     const toggle = document.getElementById('auto-refresh-toggle') as HTMLInputElement;
+    const intervalSelect = document.getElementById('refresh-interval') as HTMLSelectElement;
     const statusEl = document.getElementById('refresh-status')!;
 
     if (toggle.checked) {
@@ -407,6 +785,9 @@ function toggleAutoRefresh(): void {
         statusEl.textContent = 'Auto-refresh off';
         statusEl.classList.remove('active');
     }
+
+    // Save state to localStorage
+    saveAutoRefreshState(toggle.checked, parseInt(intervalSelect.value));
 }
 
 function startAutoRefresh(): void {
@@ -425,16 +806,37 @@ function stopAutoRefresh(): void {
     }
 }
 
+function restoreAutoRefreshState(): void {
+    const state = loadAutoRefreshState();
+    const toggle = document.getElementById('auto-refresh-toggle') as HTMLInputElement;
+    const intervalSelect = document.getElementById('refresh-interval') as HTMLSelectElement;
+    const statusEl = document.getElementById('refresh-status')!;
+
+    // Restore interval selection
+    intervalSelect.value = state.interval.toString();
+
+    // Restore toggle state
+    if (state.enabled) {
+        toggle.checked = true;
+        startAutoRefresh();
+        statusEl.textContent = 'Auto-refresh on';
+        statusEl.classList.add('active');
+        log('Auto-refresh restored from saved settings', 'info');
+    }
+}
+
 async function autoRefreshPrices(): Promise<void> {
     try {
-        const symbols = await api.getSymbols();
-        if (!symbols || symbols.length === 0) {
+        // Only refresh favorited symbols (marked with moon)
+        const favoritedSymbols = await api.getFavoritedSymbols();
+        if (!favoritedSymbols || favoritedSymbols.length === 0) {
+            log('Auto-refresh: No favorited symbols (click ☆ to add)', 'info');
             updateLastRefreshTime();
             return;
         }
 
-        const symbolList = symbols.map(s => s.symbol).join(',');
-        log(`Auto-refreshing ${symbols.length} symbols...`, 'info');
+        const symbolList = favoritedSymbols.join(',');
+        log(`Auto-refreshing ${favoritedSymbols.length} favorited symbols...`, 'info');
 
         const result = await api.fetchPrices(symbolList, '1d');
         log(`Auto-refresh: ${result.message}`, result.success ? 'success' : 'error');
@@ -627,11 +1029,20 @@ function setupEventListeners(): void {
     document.getElementById('auto-refresh-toggle')?.addEventListener('change', toggleAutoRefresh);
     document.getElementById('refresh-interval')?.addEventListener('change', () => {
         const toggle = document.getElementById('auto-refresh-toggle') as HTMLInputElement;
+        const intervalSelect = document.getElementById('refresh-interval') as HTMLSelectElement;
+
+        // Save the new interval
+        saveAutoRefreshState(toggle.checked, parseInt(intervalSelect.value));
+
         if (toggle.checked) {
             stopAutoRefresh();
             startAutoRefresh();
         }
     });
+
+    // S&P 100 and ASX 100 buttons
+    document.getElementById('sp100-btn')?.addEventListener('click', fetchSP100);
+    document.getElementById('asx100-btn')?.addEventListener('click', fetchASX100);
 
     // Chart controls
     document.getElementById('load-chart-btn')?.addEventListener('click', loadChart);
@@ -639,12 +1050,67 @@ function setupEventListeners(): void {
         checkbox.addEventListener('change', updateChartIndicators);
     });
 
+    // Chart favorite button
+    document.getElementById('chart-favorite-btn')?.addEventListener('click', async () => {
+        const symbol = (document.getElementById('chart-symbol') as HTMLInputElement).value.trim().toUpperCase();
+        if (!symbol) { alert('Enter a symbol first'); return; }
+        await toggleFavoriteButton('chart-favorite-btn', symbol);
+    });
+    document.getElementById('chart-symbol')?.addEventListener('change', () => {
+        updateFavoriteButtonState('chart-symbol', 'chart-favorite-btn');
+    });
+
     // Indicators
     document.getElementById('calc-indicators-btn')?.addEventListener('click', calculateIndicators);
     document.getElementById('show-indicator-chart-btn')?.addEventListener('click', showIndicatorChart);
 
+    // Indicator favorite button
+    document.getElementById('indicator-favorite-btn')?.addEventListener('click', async () => {
+        const symbol = (document.getElementById('indicator-symbol') as HTMLInputElement).value.trim().toUpperCase();
+        if (!symbol) { alert('Enter a symbol first'); return; }
+        await toggleFavoriteButton('indicator-favorite-btn', symbol);
+    });
+    document.getElementById('indicator-symbol')?.addEventListener('change', () => {
+        updateFavoriteButtonState('indicator-symbol', 'indicator-favorite-btn');
+    });
+
+    // Indicator list click - show chart for clicked indicator
+    document.getElementById('indicator-list')?.addEventListener('click', async (e) => {
+        const target = (e.target as HTMLElement).closest('.symbol-item');
+        if (target) {
+            const indicatorName = target.getAttribute('data-indicator');
+            const symbol = (document.getElementById('indicator-symbol') as HTMLInputElement).value.trim();
+            if (indicatorName && symbol) {
+                // Update dropdown to match clicked indicator
+                const select = document.getElementById('indicator-select') as HTMLSelectElement;
+                if (select) {
+                    select.value = indicatorName;
+                }
+                // Show the chart
+                initializeIndicatorChart();
+                try {
+                    log(`Loading ${indicatorName} chart for ${symbol}...`, 'info');
+                    await indicatorChart?.loadIndicator(symbol, indicatorName);
+                    log(`Indicator chart loaded`, 'success');
+                } catch (error) {
+                    log(`Error loading indicator chart: ${error}`, 'error');
+                }
+            }
+        }
+    });
+
     // Alerts
     document.getElementById('add-alert-btn')?.addEventListener('click', addAlert);
+
+    // Alert favorite button
+    document.getElementById('alert-favorite-btn')?.addEventListener('click', async () => {
+        const symbol = (document.getElementById('alert-symbol') as HTMLInputElement).value.trim().toUpperCase();
+        if (!symbol) { alert('Enter a symbol first'); return; }
+        await toggleFavoriteButton('alert-favorite-btn', symbol);
+    });
+    document.getElementById('alert-symbol')?.addEventListener('change', () => {
+        updateFavoriteButtonState('alert-symbol', 'alert-favorite-btn');
+    });
     document.getElementById('check-alerts-btn')?.addEventListener('click', async () => {
         try {
             log('Checking alerts...', 'info');
@@ -703,11 +1169,31 @@ function setupEventListeners(): void {
         }
     });
 
-    // Symbol list click - view in chart
-    document.getElementById('symbol-list')?.addEventListener('click', (e) => {
-        const target = (e.target as HTMLElement).closest('.symbol-item');
-        if (target) {
+    // Symbol list click - toggle favorite or view in chart
+    document.getElementById('symbol-list')?.addEventListener('click', async (e) => {
+        const target = e.target as HTMLElement;
+
+        // Check if clicked on favorite toggle (moon icon)
+        if (target.classList.contains('favorite-toggle')) {
+            e.stopPropagation();
             const symbol = target.getAttribute('data-symbol');
+            if (symbol) {
+                try {
+                    const newState = await api.toggleFavorite(symbol);
+                    target.textContent = newState ? '🌙' : '☽';
+                    target.classList.toggle('favorited', newState);
+                    log(`${symbol} ${newState ? 'added to' : 'removed from'} auto-refresh`, 'info');
+                } catch (error) {
+                    log(`Error toggling favorite: ${error}`, 'error');
+                }
+            }
+            return;
+        }
+
+        // Otherwise, view in chart
+        const item = target.closest('.symbol-item');
+        if (item) {
+            const symbol = item.getAttribute('data-symbol');
             if (symbol) {
                 (document.getElementById('chart-symbol') as HTMLInputElement).value = symbol;
                 (document.getElementById('indicator-symbol') as HTMLInputElement).value = symbol;
@@ -715,6 +1201,47 @@ function setupEventListeners(): void {
                 loadChart();
             }
         }
+    });
+
+    // Groups tab
+    document.getElementById('create-group-btn')?.addEventListener('click', createGroup);
+    document.getElementById('add-symbol-btn')?.addEventListener('click', addSymbolToGroup);
+    document.getElementById('delete-group-btn')?.addEventListener('click', deleteGroup);
+    document.getElementById('fetch-group-btn')?.addEventListener('click', fetchGroupPrices);
+
+    // Group favorite button
+    document.getElementById('group-favorite-btn')?.addEventListener('click', async () => {
+        const symbol = (document.getElementById('add-symbol-input') as HTMLInputElement).value.trim().toUpperCase();
+        if (!symbol) { alert('Enter a symbol first'); return; }
+        await toggleFavoriteButton('group-favorite-btn', symbol);
+    });
+
+    // Groups list click - load detail
+    document.getElementById('groups-list')?.addEventListener('click', (e) => {
+        const target = (e.target as HTMLElement).closest('.group-item');
+        if (target) {
+            const groupName = target.getAttribute('data-group');
+            if (groupName) loadGroupDetail(groupName);
+        }
+    });
+
+    // Group symbols list - remove symbol
+    document.getElementById('group-symbols-list')?.addEventListener('click', async (e) => {
+        const target = e.target as HTMLElement;
+        if (target.classList.contains('remove-symbol-btn')) {
+            const symbol = target.getAttribute('data-symbol');
+            if (symbol) await removeSymbolFromGroup(symbol);
+        }
+    });
+
+    // Preset groups
+    document.querySelectorAll('.preset-group').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const name = btn.getAttribute('data-name');
+            const symbols = btn.getAttribute('data-symbols');
+            const desc = btn.getAttribute('data-desc');
+            if (name && symbols) createPresetGroup(name, symbols, desc || '');
+        });
     });
 }
 
@@ -730,4 +1257,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (dateInput) {
         dateInput.valueAsDate = new Date();
     }
+
+    // Restore auto-refresh state from localStorage
+    restoreAutoRefreshState();
 });

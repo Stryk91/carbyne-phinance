@@ -8,6 +8,7 @@ export interface SymbolPrice {
     price: number;
     change_percent: number;
     change_direction: string;
+    favorited: boolean;
 }
 
 export interface CommandResult {
@@ -68,6 +69,14 @@ export interface Portfolio {
 // API functions
 export async function getSymbols(): Promise<SymbolPrice[]> {
     return invoke('get_symbols');
+}
+
+export async function toggleFavorite(symbol: string): Promise<boolean> {
+    return invoke('toggle_favorite', { symbol });
+}
+
+export async function getFavoritedSymbols(): Promise<string[]> {
+    return invoke('get_favorited_symbols');
 }
 
 export async function fetchPrices(symbols: string, period: string): Promise<CommandResult> {
@@ -150,4 +159,52 @@ export async function fetchTrends(keyword: string): Promise<CommandResult> {
 
 export async function getTrends(keyword: string): Promise<{ date: string; value: number }[]> {
     return invoke('get_trends', { keyword });
+}
+
+// Watchlists / Symbol Groups
+export interface WatchlistSummary {
+    id: number;
+    name: string;
+    description: string | null;
+    symbol_count: number;
+}
+
+export interface WatchlistDetail {
+    id: number;
+    name: string;
+    description: string | null;
+    symbol_count: number;
+    symbols: string[];
+}
+
+export async function createWatchlist(name: string, symbols: string[], description: string | null): Promise<CommandResult> {
+    return invoke('create_watchlist', { name, symbols, description });
+}
+
+export async function getAllWatchlists(): Promise<WatchlistSummary[]> {
+    return invoke('get_all_watchlists');
+}
+
+export async function getWatchlistDetail(name: string): Promise<WatchlistDetail | null> {
+    return invoke('get_watchlist_detail', { name });
+}
+
+export async function deleteWatchlist(name: string): Promise<CommandResult> {
+    return invoke('delete_watchlist', { name });
+}
+
+export async function addSymbolToWatchlist(watchlistName: string, symbol: string): Promise<CommandResult> {
+    return invoke('add_symbol_to_watchlist', { watchlistName, symbol });
+}
+
+export async function removeSymbolFromWatchlist(watchlistName: string, symbol: string): Promise<CommandResult> {
+    return invoke('remove_symbol_from_watchlist', { watchlistName, symbol });
+}
+
+export async function updateWatchlistDescription(name: string, description: string | null): Promise<CommandResult> {
+    return invoke('update_watchlist_description', { name, description });
+}
+
+export async function renameWatchlist(oldName: string, newName: string): Promise<CommandResult> {
+    return invoke('rename_watchlist', { oldName, newName });
 }

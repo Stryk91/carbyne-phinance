@@ -259,6 +259,25 @@ button:disabled {
     border-bottom: none;
 }
 
+.symbol-item.selected,
+.group-item.selected {
+    background: rgba(56, 189, 248, 0.15);
+    border-left: 3px solid var(--accent);
+}
+
+.group-quick-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.group-quick-actions h5 {
+    width: 100%;
+    margin: 0 0 8px 0;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
 .symbol-ticker {
     font-weight: 600;
     font-family: 'Monaco', 'Menlo', monospace;
@@ -501,4 +520,56 @@ button:disabled {
 .badge-short {
     background: var(--error);
     color: var(--bg-primary);
+}
+
+/* Favorite toggle in stock list */
+.favorite-toggle {
+    background: transparent;
+    border: 2px solid #fbbf24;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    color: #fbbf24;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+}
+
+.favorite-toggle:hover {
+    background: #fbbf24;
+    color: #1e293b;
+}
+
+.favorite-toggle.favorited {
+    background: #fbbf24;
+    color: #1e293b;
+}
+
+/* Favorite button in forms - pill shaped, moon yellow */
+.favorite-btn {
+    background: #1e293b;
+    border: 2px solid #fbbf24;
+    border-radius: 20px;
+    padding: 6px 16px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #fbbf24;
+    transition: all 0.2s;
+    min-width: 60px;
+    text-align: center;
+}
+
+.favorite-btn:hover {
+    background: #fbbf24;
+    color: #1e293b;
+}
+
+.favorite-btn.favorited {
+    background: #fbbf24;
+    color: #1e293b;
 }

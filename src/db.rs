@@ -1,7 +1,7 @@
 //! SQLite database layer for Financial Pipeline
 
 use chrono::{NaiveDate, Utc};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use std::path::Path;
 
 use crate::error::Result;
@@ -39,7 +39,29 @@ impl Database {
     /// Initialize database schema
     pub fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_SQL)?;
+        // Run migrations for existing databases
+        self.run_migrations()?;
         println!("[OK] Database schema initialized");
+        Ok(())
+    }
+
+    /// Run database migrations for existing tables
+    fn run_migrations(&self) -> Result<()> {
+        // Add favorited column to symbols table if it doesn't exist
+        let columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(symbols)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        if !columns.contains(&"favorited".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE symbols ADD COLUMN favorited INTEGER DEFAULT 0",
+                [],
+            )?;
+            println!("[MIGRATION] Added favorited column to symbols table");
+        }
+
         Ok(())
     }
 
@@ -315,6 +337,55 @@ impl Database {
         Ok(())
     }
 
+    /// Toggle symbol favorite status
+    pub fn toggle_symbol_favorite(&self, symbol: &str) -> Result<bool> {
+        // First ensure the symbol exists in the symbols table
+        self.conn.execute(
+            "INSERT OR IGNORE INTO symbols (symbol, favorited) VALUES (?1, 0)",
+            params![symbol],
+        )?;
+
+        // Toggle the favorite status
+        self.conn.execute(
+            "UPDATE symbols SET favorited = CASE WHEN favorited = 1 THEN 0 ELSE 1 END WHERE symbol = ?1",
+            params![symbol],
+        )?;
+
+        // Return new state
+        let favorited: i32 = self.conn.query_row(
+            "SELECT favorited FROM symbols WHERE symbol = ?1",
+            params![symbol],
+            |row| row.get(0),
+        )?;
+
+        Ok(favorited == 1)
+    }
+
+    /// Get favorite status for a symbol
+    pub fn is_symbol_favorited(&self, symbol: &str) -> Result<bool> {
+        let result: Option<i32> = self
+            .conn
+            .query_row(
+                "SELECT favorited FROM symbols WHERE symbol = ?1",
+                params![symbol],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        Ok(result.unwrap_or(0) == 1)
+    }
+
+    /// Get all favorited symbols
+    pub fn get_favorited_symbols(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol FROM symbols WHERE favorited = 1"
+        )?;
+        let symbols = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        Ok(symbols)
+    }
+
     /// Create a watchlist
     pub fn create_watchlist(
         &self,
@@ -362,6 +433,164 @@ impl Database {
             .collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(symbols)
+    }
+
+    /// Get all watchlists with their details
+    pub fn get_all_watchlists(&self) -> Result<Vec<(i64, String, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT w.id, w.name, w.description, COUNT(ws.symbol) as symbol_count
+            FROM watchlists w
+            LEFT JOIN watchlist_symbols ws ON w.id = ws.watchlist_id
+            GROUP BY w.id, w.name, w.description
+            ORDER BY w.name
+            "#,
+        )?;
+
+        let watchlists = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(watchlists)
+    }
+
+    /// Get watchlist with full info (name, description, symbols)
+    pub fn get_watchlist_full(&self, name: &str) -> Result<Option<(i64, String, Option<String>, Vec<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description FROM watchlists WHERE name = ?1",
+        )?;
+
+        let result: Option<(i64, String, Option<String>)> = stmt
+            .query_row(params![name], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .optional()?;
+
+        match result {
+            Some((id, wl_name, description)) => {
+                let symbols = self.get_watchlist(&wl_name)?;
+                Ok(Some((id, wl_name, description, symbols)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete a watchlist by name
+    pub fn delete_watchlist(&self, name: &str) -> Result<bool> {
+        // Get the watchlist ID first
+        let watchlist_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM watchlists WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match watchlist_id {
+            Some(id) => {
+                // Delete symbols first (foreign key)
+                self.conn.execute(
+                    "DELETE FROM watchlist_symbols WHERE watchlist_id = ?1",
+                    params![id],
+                )?;
+                // Delete watchlist
+                self.conn.execute(
+                    "DELETE FROM watchlists WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Add a symbol to an existing watchlist
+    pub fn add_symbol_to_watchlist(&self, watchlist_name: &str, symbol: &str) -> Result<bool> {
+        let watchlist_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM watchlists WHERE name = ?1",
+                params![watchlist_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match watchlist_id {
+            Some(id) => {
+                // Check if symbol already exists
+                let exists: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM watchlist_symbols WHERE watchlist_id = ?1 AND symbol = ?2",
+                        params![id, symbol],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+
+                if !exists {
+                    self.conn.execute(
+                        "INSERT INTO watchlist_symbols (watchlist_id, symbol) VALUES (?1, ?2)",
+                        params![id, symbol],
+                    )?;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Remove a symbol from a watchlist
+    pub fn remove_symbol_from_watchlist(&self, watchlist_name: &str, symbol: &str) -> Result<bool> {
+        let watchlist_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM watchlists WHERE name = ?1",
+                params![watchlist_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match watchlist_id {
+            Some(id) => {
+                let deleted = self.conn.execute(
+                    "DELETE FROM watchlist_symbols WHERE watchlist_id = ?1 AND symbol = ?2",
+                    params![id, symbol],
+                )?;
+                Ok(deleted > 0)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Update watchlist description
+    pub fn update_watchlist_description(&self, name: &str, description: Option<&str>) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE watchlists SET description = ?1 WHERE name = ?2",
+            params![description, name],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Rename a watchlist
+    pub fn rename_watchlist(&self, old_name: &str, new_name: &str) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE watchlists SET name = ?1 WHERE name = ?2",
+            params![new_name, old_name],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Vacuum/optimize the database
@@ -1480,8 +1709,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     currency TEXT,
     isin TEXT,
     asset_class TEXT,
+    favorited INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
 
 -- Daily price data
 CREATE TABLE IF NOT EXISTS daily_prices (

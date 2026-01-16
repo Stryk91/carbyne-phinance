@@ -21,6 +21,7 @@ struct SymbolPrice {
     price: f64,
     change_percent: f64,
     change_direction: String, // "up", "down", or "unchanged"
+    favorited: bool,          // moon icon for auto-refresh
 }
 
 /// Command result
@@ -56,6 +57,9 @@ fn get_symbols(state: State<AppState>) -> Result<Vec<SymbolPrice>, String> {
 
     let mut result = Vec::new();
     for symbol in symbols {
+        // Check if favorited
+        let favorited = db.is_symbol_favorited(&symbol).unwrap_or(false);
+
         // Get price history to calculate percent change
         if let Ok(prices) = db.get_prices(&symbol) {
             if prices.len() >= 2 {
@@ -81,6 +85,7 @@ fn get_symbols(state: State<AppState>) -> Result<Vec<SymbolPrice>, String> {
                     price: current.close,
                     change_percent,
                     change_direction,
+                    favorited,
                 });
             } else if let Some(price) = prices.last() {
                 result.push(SymbolPrice {
@@ -88,12 +93,27 @@ fn get_symbols(state: State<AppState>) -> Result<Vec<SymbolPrice>, String> {
                     price: price.close,
                     change_percent: 0.0,
                     change_direction: "unchanged".to_string(),
+                    favorited,
                 });
             }
         }
     }
 
     Ok(result)
+}
+
+/// Toggle symbol favorite status (moon icon)
+#[tauri::command]
+fn toggle_favorite(state: State<AppState>, symbol: String) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.toggle_symbol_favorite(&symbol).map_err(|e| e.to_string())
+}
+
+/// Get all favorited symbols
+#[tauri::command]
+fn get_favorited_symbols(state: State<AppState>) -> Result<Vec<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_favorited_symbols().map_err(|e| e.to_string())
 }
 
 /// Fetch stock prices from Yahoo Finance
@@ -1429,6 +1449,216 @@ fn delete_backtest(state: State<AppState>, backtest_id: i64) -> Result<CommandRe
     })
 }
 
+// ============================================================================
+// Watchlist/Symbol Group Commands
+// ============================================================================
+
+/// Watchlist data for frontend
+#[derive(Serialize)]
+struct WatchlistData {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    symbol_count: i64,
+    symbols: Vec<String>,
+}
+
+/// Watchlist summary (without symbols) for list views
+#[derive(Serialize)]
+struct WatchlistSummary {
+    id: i64,
+    name: String,
+    description: Option<String>,
+    symbol_count: i64,
+}
+
+/// Create a new watchlist/symbol group
+#[tauri::command]
+fn create_watchlist(
+    state: State<AppState>,
+    name: String,
+    symbols: Vec<String>,
+    description: Option<String>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let symbols_upper: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+
+    db.create_watchlist(&name, &symbols_upper, description.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    println!("[OK] Created watchlist '{}' with {} symbols", name, symbols_upper.len());
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Watchlist '{}' created with {} symbols", name, symbols_upper.len()),
+    })
+}
+
+/// Get all watchlists (summary view)
+#[tauri::command]
+fn get_all_watchlists(state: State<AppState>) -> Result<Vec<WatchlistSummary>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let watchlists = db.get_all_watchlists().map_err(|e| e.to_string())?;
+
+    Ok(watchlists
+        .into_iter()
+        .map(|(id, name, description, symbol_count)| WatchlistSummary {
+            id,
+            name,
+            description,
+            symbol_count,
+        })
+        .collect())
+}
+
+/// Get a watchlist with its symbols
+#[tauri::command]
+fn get_watchlist_detail(state: State<AppState>, name: String) -> Result<Option<WatchlistData>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let result = db.get_watchlist_full(&name).map_err(|e| e.to_string())?;
+
+    Ok(result.map(|(id, name, description, symbols)| WatchlistData {
+        id,
+        name,
+        description,
+        symbol_count: symbols.len() as i64,
+        symbols,
+    }))
+}
+
+/// Delete a watchlist
+#[tauri::command]
+fn delete_watchlist(state: State<AppState>, name: String) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let deleted = db.delete_watchlist(&name).map_err(|e| e.to_string())?;
+
+    if deleted {
+        println!("[OK] Deleted watchlist '{}'", name);
+        Ok(CommandResult {
+            success: true,
+            message: format!("Watchlist '{}' deleted", name),
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            message: format!("Watchlist '{}' not found", name),
+        })
+    }
+}
+
+/// Add a symbol to an existing watchlist
+#[tauri::command]
+fn add_symbol_to_watchlist(
+    state: State<AppState>,
+    watchlist_name: String,
+    symbol: String,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    let success = db
+        .add_symbol_to_watchlist(&watchlist_name, &symbol)
+        .map_err(|e| e.to_string())?;
+
+    if success {
+        println!("[OK] Added {} to watchlist '{}'", symbol, watchlist_name);
+        Ok(CommandResult {
+            success: true,
+            message: format!("Added {} to '{}'", symbol, watchlist_name),
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            message: format!("Watchlist '{}' not found", watchlist_name),
+        })
+    }
+}
+
+/// Remove a symbol from a watchlist
+#[tauri::command]
+fn remove_symbol_from_watchlist(
+    state: State<AppState>,
+    watchlist_name: String,
+    symbol: String,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    let success = db
+        .remove_symbol_from_watchlist(&watchlist_name, &symbol)
+        .map_err(|e| e.to_string())?;
+
+    if success {
+        println!("[OK] Removed {} from watchlist '{}'", symbol, watchlist_name);
+        Ok(CommandResult {
+            success: true,
+            message: format!("Removed {} from '{}'", symbol, watchlist_name),
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            message: format!("Symbol {} not found in watchlist '{}'", symbol, watchlist_name),
+        })
+    }
+}
+
+/// Update watchlist description
+#[tauri::command]
+fn update_watchlist_description(
+    state: State<AppState>,
+    name: String,
+    description: Option<String>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let success = db
+        .update_watchlist_description(&name, description.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    if success {
+        Ok(CommandResult {
+            success: true,
+            message: format!("Watchlist '{}' description updated", name),
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            message: format!("Watchlist '{}' not found", name),
+        })
+    }
+}
+
+/// Rename a watchlist
+#[tauri::command]
+fn rename_watchlist(
+    state: State<AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let success = db
+        .rename_watchlist(&old_name, &new_name)
+        .map_err(|e| e.to_string())?;
+
+    if success {
+        println!("[OK] Renamed watchlist '{}' to '{}'", old_name, new_name);
+        Ok(CommandResult {
+            success: true,
+            message: format!("Watchlist renamed from '{}' to '{}'", old_name, new_name),
+        })
+    } else {
+        Ok(CommandResult {
+            success: false,
+            message: format!("Watchlist '{}' not found", old_name),
+        })
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize database
@@ -1440,6 +1670,8 @@ pub fn run() {
         .manage(AppState { db: Mutex::new(db) })
         .invoke_handler(tauri::generate_handler![
             get_symbols,
+            toggle_favorite,
+            get_favorited_symbols,
             fetch_prices,
             fetch_fred,
             get_macro_data,
@@ -1478,6 +1710,15 @@ pub fn run() {
             get_backtest_results,
             get_backtest_detail,
             delete_backtest,
+            // Watchlist/Symbol Group commands
+            create_watchlist,
+            get_all_watchlists,
+            get_watchlist_detail,
+            delete_watchlist,
+            add_symbol_to_watchlist,
+            remove_symbol_from_watchlist,
+            update_watchlist_description,
+            rename_watchlist,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
