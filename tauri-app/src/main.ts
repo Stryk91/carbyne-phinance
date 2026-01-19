@@ -3,6 +3,40 @@ import './styles.css';
 import * as api from './api';
 import { TradingViewChart, IndicatorChart } from './chart';
 
+// =============================================================================
+// SECURITY: HTML Sanitization to prevent XSS attacks
+// =============================================================================
+
+/**
+ * Escapes HTML special characters to prevent XSS
+ * ALWAYS use this when inserting user-controlled data into innerHTML
+ */
+function escapeHtml(unsafe: string): string {
+    if (typeof unsafe !== 'string') return String(unsafe);
+    return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+/**
+ * Sanitizes a number for display (prevents NaN injection)
+ */
+function sanitizeNumber(value: number, decimals: number = 2): string {
+    if (typeof value !== 'number' || isNaN(value)) return '0.00';
+    return value.toFixed(decimals);
+}
+
+/**
+ * Validates and sanitizes a symbol string (uppercase alphanumeric + dots/dashes only)
+ */
+function sanitizeSymbol(symbol: string): string {
+    if (typeof symbol !== 'string') return '';
+    return symbol.toUpperCase().replace(/[^A-Z0-9.\-]/g, '').substring(0, 20);
+}
+
 // S&P 100 Symbol List (OEX constituents)
 const SP100_SYMBOLS = [
     'AAPL', 'ABBV', 'ABT', 'ACN', 'ADBE', 'AIG', 'AMD', 'AMGN', 'AMT', 'AMZN',
@@ -1005,21 +1039,22 @@ async function performAISearch(): Promise<void> {
             return;
         }
 
+        // SECURITY: Escape all user-controlled content to prevent XSS
         resultsDiv.innerHTML = results.map(r => `
-            <div class="ai-result-item" data-type="${r.result_type}">
+            <div class="ai-result-item" data-type="${escapeHtml(r.result_type)}">
                 <div class="ai-result-header">
-                    <span class="ai-result-type ${r.result_type}">${r.result_type.replace('_', ' ')}</span>
-                    <span class="ai-result-score">${(r.score * 100).toFixed(1)}% match</span>
-                    ${r.symbol ? `<span class="ai-result-symbol">${r.symbol}</span>` : ''}
+                    <span class="ai-result-type ${escapeHtml(r.result_type)}">${escapeHtml(r.result_type.replace('_', ' '))}</span>
+                    <span class="ai-result-score">${sanitizeNumber(r.score * 100, 1)}% match</span>
+                    ${r.symbol ? `<span class="ai-result-symbol">${escapeHtml(r.symbol)}</span>` : ''}
                 </div>
-                <div class="ai-result-content">${r.content}</div>
-                ${r.date ? `<div class="ai-result-date">${r.date}</div>` : ''}
+                <div class="ai-result-content">${escapeHtml(r.content)}</div>
+                ${r.date ? `<div class="ai-result-date">${escapeHtml(r.date)}</div>` : ''}
             </div>
         `).join('');
 
         log(`Found ${results.length} results for "${query}"`, 'success');
     } catch (error) {
-        resultsDiv.innerHTML = `<p class="empty-state error">Error: ${error}</p>`;
+        resultsDiv.innerHTML = `<p class="empty-state error">Error: ${escapeHtml(String(error))}</p>`;
         log(`AI Search error: ${error}`, 'error');
     }
 }
@@ -1119,6 +1154,13 @@ function saveClaudeApiKey(): void {
     const key = keyInput.value.trim();
 
     if (key) {
+        // SECURITY: Validate API key format before storing
+        if (!key.startsWith('sk-ant-') || key.length < 50) {
+            statusSpan.textContent = 'Invalid key format';
+            statusSpan.style.color = 'var(--error)';
+            log('Invalid API key format - must start with sk-ant-', 'error');
+            return;
+        }
         localStorage.setItem(CLAUDE_API_KEY_STORAGE, key);
         statusSpan.textContent = 'Key saved';
         statusSpan.style.color = 'var(--success)';
@@ -1129,6 +1171,10 @@ function saveClaudeApiKey(): void {
         statusSpan.style.color = 'var(--text-secondary)';
     }
 }
+
+// SECURITY: Rate limiting for API calls
+let lastClaudeCallTime = 0;
+const CLAUDE_RATE_LIMIT_MS = 2000; // Minimum 2 seconds between calls
 
 async function sendClaudeChat(): Promise<void> {
     const query = (document.getElementById('claude-chat-query') as HTMLInputElement).value.trim();
@@ -1144,6 +1190,20 @@ async function sendClaudeChat(): Promise<void> {
         return;
     }
 
+    // SECURITY: Rate limiting to prevent API abuse
+    const now = Date.now();
+    if (now - lastClaudeCallTime < CLAUDE_RATE_LIMIT_MS) {
+        alert(`Please wait ${Math.ceil((CLAUDE_RATE_LIMIT_MS - (now - lastClaudeCallTime)) / 1000)} seconds before making another request`);
+        return;
+    }
+    lastClaudeCallTime = now;
+
+    // SECURITY: Validate query length to prevent abuse
+    if (query.length > 10000) {
+        alert('Query too long. Maximum 10,000 characters.');
+        return;
+    }
+
     const responseDiv = document.getElementById('claude-chat-response')!;
     const metaDiv = document.getElementById('claude-chat-meta')!;
     const chatBtn = document.getElementById('claude-chat-btn') as HTMLButtonElement;
@@ -1156,8 +1216,9 @@ async function sendClaudeChat(): Promise<void> {
         log(`Claude query: "${query.substring(0, 50)}..."`, 'info');
         const result = await api.claudeChat(query, apiKey);
 
-        // Format the response with markdown-like styling
-        const formattedResponse = result.response
+        // SECURITY: First escape HTML, THEN apply markdown formatting
+        const sanitizedResponse = escapeHtml(result.response);
+        const formattedResponse = sanitizedResponse
             .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
             .replace(/\n\n/g, '</p><p>')
             .replace(/\n/g, '<br>');
@@ -1179,7 +1240,7 @@ async function sendClaudeChat(): Promise<void> {
         // Refresh vector stats since the conversation was saved
         await loadVectorStats();
     } catch (error) {
-        responseDiv.innerHTML = `<p class="empty-state" style="color: var(--error);">Error: ${error}</p>`;
+        responseDiv.innerHTML = `<p class="empty-state" style="color: var(--error);">Error: ${escapeHtml(String(error))}</p>`;
         log(`Claude error: ${error}`, 'error');
     } finally {
         chatBtn.disabled = false;
