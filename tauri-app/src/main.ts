@@ -1247,6 +1247,287 @@ async function sendClaudeChat(): Promise<void> {
     }
 }
 
+// ============================================================================
+// Finnhub News Functions
+// ============================================================================
+
+const FINNHUB_API_KEY_STORAGE = 'fp_finnhub_api_key';
+
+// Store fetched news for "Save All" functionality
+let fetchedNewsItems: api.SimpleNewsItem[] = [];
+
+function loadFinnhubApiKey(): void {
+    const savedKey = localStorage.getItem(FINNHUB_API_KEY_STORAGE);
+    const keyInput = document.getElementById('finnhub-api-key') as HTMLInputElement;
+
+    if (savedKey && keyInput) {
+        keyInput.value = savedKey;
+    }
+}
+
+function saveFinnhubApiKey(): void {
+    const keyInput = document.getElementById('finnhub-api-key') as HTMLInputElement;
+    const key = keyInput.value.trim();
+
+    if (key) {
+        localStorage.setItem(FINNHUB_API_KEY_STORAGE, key);
+        log('Finnhub API key saved', 'success');
+        alert('Finnhub API key saved!');
+    } else {
+        localStorage.removeItem(FINNHUB_API_KEY_STORAGE);
+        log('Finnhub API key cleared', 'info');
+    }
+}
+
+async function fetchNewsAndPopulateForm(): Promise<void> {
+    const symbolInput = (document.getElementById('ai-search-query') as HTMLInputElement).value.trim().toUpperCase();
+    const apiKey = localStorage.getItem(FINNHUB_API_KEY_STORAGE) || '';
+
+    if (!apiKey) {
+        alert('Please enter and save your Finnhub API key first.\nGet a free key at https://finnhub.io');
+        return;
+    }
+
+    if (!symbolInput) {
+        alert('Please enter a stock symbol (e.g., NVDA, AAPL)');
+        return;
+    }
+
+    // Extract and sanitize the symbol (in case user entered a full name or extra text)
+    const symbol = sanitizeSymbol(symbolInput.split(/\s+/)[0]);
+
+    if (!symbol) {
+        alert('Invalid symbol format');
+        return;
+    }
+
+    const resultsDiv = document.getElementById('ai-search-results')!;
+    resultsDiv.innerHTML = `<p>Fetching news for ${escapeHtml(symbol)}...</p>`;
+
+    try {
+        log(`Fetching news for ${symbol}...`, 'info');
+        const response = await api.fetchNews(symbol, apiKey, 5);
+
+        if (response.count === 0) {
+            resultsDiv.innerHTML = `<p class="empty-state">No recent news found for ${escapeHtml(symbol)}.</p>`;
+            fetchedNewsItems = [];
+            return;
+        }
+
+        // Store news items for Save All functionality
+        fetchedNewsItems = response.news;
+
+        // Show news items in results with Save All button and auto-link option
+        resultsDiv.innerHTML = `
+            <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <button id="save-all-news-btn" style="background: var(--accent); color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;">
+                    Save All ${response.count} News Items
+                </button>
+                <label style="display: flex; align-items: center; gap: 4px; font-size: 0.9em; cursor: pointer;" title="Fetches price data around each news date and creates linked patterns showing price reaction">
+                    <input type="checkbox" id="auto-link-pattern" checked style="cursor: pointer;">
+                    <span>Auto-link price patterns</span>
+                </label>
+            </div>
+        ` + response.news.map((item, index) => `
+            <div class="ai-result-item news-item" data-index="${index}" style="border-left-color: var(--accent);">
+                <div class="ai-result-header" style="cursor: pointer;">
+                    <span class="ai-result-type news">news</span>
+                    <span class="ai-result-date">${escapeHtml(item.date)}</span>
+                    <span class="ai-result-symbol">${escapeHtml(item.symbol)}</span>
+                </div>
+                <div class="ai-result-content" style="cursor: pointer;"><strong>${escapeHtml(item.headline)}</strong></div>
+                <div class="news-summary" data-index="${index}" style="font-size: 0.9em; color: var(--text-secondary);">
+                    <span class="summary-preview">${escapeHtml(item.summary.substring(0, 200))}${item.summary.length > 200 ? '...' : ''}</span>
+                    <span class="summary-full" style="display: none;">${escapeHtml(item.summary)}</span>
+                </div>
+                <div style="font-size: 0.8em; color: var(--text-secondary); margin-top: 4px;">
+                    Source: ${escapeHtml(item.source)} |
+                    <a href="#" class="read-more-link" data-index="${index}" style="color: var(--accent);">Read more ▼</a>
+                    ${item.url ? ` | <a href="#" class="open-article-link" data-index="${index}" data-url="${escapeHtml(item.url)}" data-title="${escapeHtml(item.headline)}" style="color: var(--accent); cursor: pointer;">Open article ↗</a>` : ''}
+                </div>
+            </div>
+        `).join('');
+
+        // Add Save All button handler
+        document.getElementById('save-all-news-btn')?.addEventListener('click', saveAllFetchedNews);
+
+        // Add click handlers for news items (to populate form)
+        resultsDiv.querySelectorAll('.news-item .ai-result-header, .news-item .ai-result-content').forEach((elem) => {
+            elem.addEventListener('click', (e) => {
+                const newsItem = (e.currentTarget as HTMLElement).closest('.news-item');
+                const index = parseInt(newsItem?.getAttribute('data-index') || '0');
+                populateEventFormFromNews(response.news[index]);
+            });
+        });
+
+        // Add Read More handlers (expand/collapse)
+        resultsDiv.querySelectorAll('.read-more-link').forEach((link) => {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const index = (e.currentTarget as HTMLElement).getAttribute('data-index');
+                const summaryDiv = resultsDiv.querySelector(`.news-summary[data-index="${index}"]`);
+                const preview = summaryDiv?.querySelector('.summary-preview') as HTMLElement;
+                const full = summaryDiv?.querySelector('.summary-full') as HTMLElement;
+                const linkElem = e.currentTarget as HTMLElement;
+
+                if (preview && full) {
+                    if (full.style.display === 'none') {
+                        preview.style.display = 'none';
+                        full.style.display = 'inline';
+                        linkElem.textContent = 'Show less ▲';
+                    } else {
+                        preview.style.display = 'inline';
+                        full.style.display = 'none';
+                        linkElem.textContent = 'Read more ▼';
+                    }
+                }
+            });
+        });
+
+        // Add Open Article handlers (open in Tauri webview window)
+        resultsDiv.querySelectorAll('.open-article-link').forEach((link) => {
+            link.addEventListener('click', async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const elem = e.currentTarget as HTMLElement;
+                const url = elem.getAttribute('data-url');
+                const title = elem.getAttribute('data-title') || 'Article';
+
+                if (url) {
+                    try {
+                        log(`Opening article: ${title.substring(0, 50)}...`, 'info');
+                        await api.openArticleWindow(url, title);
+                    } catch (error) {
+                        log(`Failed to open article: ${error}`, 'error');
+                        // Fallback: try opening in system browser
+                        window.open(url, '_blank');
+                    }
+                }
+            });
+        });
+
+        log(`Found ${response.count} news items for ${symbol}. Click one to populate the form, or Save All.`, 'success');
+    } catch (error) {
+        resultsDiv.innerHTML = `<p class="empty-state error">Error: ${escapeHtml(String(error))}</p>`;
+        log(`News fetch error: ${error}`, 'error');
+    }
+}
+
+function populateEventFormFromNews(news: api.SimpleNewsItem): void {
+    // Populate the market event form fields
+    (document.getElementById('event-symbol') as HTMLInputElement).value = news.symbol;
+    (document.getElementById('event-type') as HTMLSelectElement).value = 'news';
+    (document.getElementById('event-title') as HTMLInputElement).value = news.headline;
+    (document.getElementById('event-content') as HTMLTextAreaElement).value = news.summary;
+    (document.getElementById('event-date') as HTMLInputElement).value = news.date;
+    // Leave sentiment empty for user to assess
+    (document.getElementById('event-sentiment') as HTMLInputElement).value = '';
+
+    log(`Form populated with: "${news.headline}"`, 'info');
+}
+
+async function saveAllFetchedNews(): Promise<void> {
+    if (fetchedNewsItems.length === 0) {
+        alert('No news items to save. Fetch news first.');
+        return;
+    }
+
+    const saveBtn = document.getElementById('save-all-news-btn') as HTMLButtonElement;
+    const autoLinkCheckbox = document.getElementById('auto-link-pattern') as HTMLInputElement;
+    const linkPattern = autoLinkCheckbox?.checked ?? false;
+
+    // Get Finnhub API key for pattern linking
+    const apiKey = linkPattern ? localStorage.getItem(FINNHUB_API_KEY_STORAGE) : null;
+
+    // Debug logging
+    log(`Pattern linking: checkbox=${!!autoLinkCheckbox}, checked=${linkPattern}, hasKey=${!!apiKey}`, 'info');
+
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = linkPattern && apiKey ? 'Saving with patterns...' : 'Saving...';
+    }
+
+    let savedCount = 0;
+    let patternsLinked = 0;
+    let errorCount = 0;
+
+    for (const news of fetchedNewsItems) {
+        try {
+            if (linkPattern && apiKey) {
+                // Use enhanced save with pattern linking
+                const result = await api.addMarketEventWithPattern(
+                    news.symbol,
+                    'news',
+                    news.headline,
+                    news.summary,
+                    news.date,
+                    null, // No sentiment auto-assigned
+                    apiKey,
+                    true, // Link pattern
+                    3     // 3 days window
+                );
+                if (result.success) {
+                    savedCount++;
+                    if (result.pattern_id) {
+                        patternsLinked++;
+                        log(`${news.symbol}: ${result.price_change_percent?.toFixed(2)}% price change`, 'info');
+                    } else {
+                        // Pattern linking failed - show why
+                        log(`${news.symbol}: Event saved, pattern failed: ${result.message}`, 'info');
+                    }
+                } else {
+                    errorCount++;
+                    log(`Failed to save: ${news.headline.substring(0, 50)}...`, 'error');
+                }
+            } else {
+                // Use basic save without pattern linking
+                const result = await api.addMarketEvent(
+                    news.symbol,
+                    'news',
+                    news.headline,
+                    news.summary,
+                    news.date,
+                    null
+                );
+                if (result.success) {
+                    savedCount++;
+                } else {
+                    errorCount++;
+                    log(`Failed to save: ${news.headline.substring(0, 50)}...`, 'error');
+                }
+            }
+        } catch (error) {
+            errorCount++;
+            log(`Error saving news: ${error}`, 'error');
+        }
+    }
+
+    // Update button state
+    if (saveBtn) {
+        const btnText = patternsLinked > 0
+            ? `Saved ${savedCount} + ${patternsLinked} patterns`
+            : `Saved ${savedCount}/${fetchedNewsItems.length}`;
+        saveBtn.textContent = btnText;
+        saveBtn.style.background = savedCount > 0 ? 'var(--success)' : 'var(--error)';
+    }
+
+    // Refresh vector stats
+    await loadVectorStats();
+
+    if (errorCount === 0) {
+        const msg = patternsLinked > 0
+            ? `Saved ${savedCount} news items with ${patternsLinked} price reaction patterns!`
+            : `Successfully saved all ${savedCount} news items to the database!`;
+        log(msg, 'success');
+    } else {
+        log(`Saved ${savedCount} items, ${errorCount} failed.`, 'error');
+    }
+
+    // Clear the stored items to prevent double-saving
+    fetchedNewsItems = [];
+}
+
 // Event listeners
 function setupEventListeners(): void {
     // Tab switching
@@ -1528,6 +1809,11 @@ function setupEventListeners(): void {
     });
     document.getElementById('add-event-btn')?.addEventListener('click', addMarketEventUI);
     document.getElementById('add-pattern-btn')?.addEventListener('click', addPricePatternUI);
+
+    // Finnhub News
+    document.getElementById('fetch-news-btn')?.addEventListener('click', fetchNewsAndPopulateForm);
+    document.getElementById('save-finnhub-key-btn')?.addEventListener('click', saveFinnhubApiKey);
+    loadFinnhubApiKey();
 
     // Claude AI Chat
     document.getElementById('save-api-key-btn')?.addEventListener('click', saveClaudeApiKey);

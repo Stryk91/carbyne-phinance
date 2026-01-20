@@ -279,3 +279,82 @@ export async function claudeChat(query: string, apiKey: string): Promise<ClaudeC
 export async function claudeQuery(query: string, apiKey: string): Promise<ClaudeChatResponse> {
     return invoke('claude_query', { query, apiKey });
 }
+
+// Finnhub News
+export interface SimpleNewsItem {
+    headline: string;
+    summary: string;
+    source: string;
+    url: string;
+    date: string;
+    symbol: string;
+}
+
+export interface FetchNewsResponse {
+    news: SimpleNewsItem[];
+    count: number;
+}
+
+export async function fetchNews(symbol: string, apiKey: string, limit: number = 5): Promise<FetchNewsResponse> {
+    return invoke('fetch_news', { symbol, apiKey, limit });
+}
+
+// Price Reaction (candle data around an event)
+export interface PriceReactionResponse {
+    symbol: string;
+    event_date: string;
+    start_date: string;
+    end_date: string;
+    pre_price: number;
+    post_price: number;
+    price_change_percent: number;
+    volume_change_percent: number;
+    candle_count: number;
+}
+
+export async function fetchPriceReaction(
+    symbol: string,
+    eventDate: string,
+    apiKey: string,
+    daysWindow: number = 3
+): Promise<PriceReactionResponse> {
+    return invoke('fetch_price_reaction', { symbol, eventDate, apiKey, daysWindow });
+}
+
+// Enhanced event saving with pattern linking
+export interface EventWithPatternResponse {
+    success: boolean;
+    message: string;
+    event_id: string;
+    pattern_id: string | null;
+    price_change_percent: number | null;
+}
+
+export async function addMarketEventWithPattern(
+    symbol: string,
+    eventType: string,
+    title: string,
+    content: string,
+    date: string,
+    sentiment: number | null,
+    apiKey: string | null,
+    linkPattern: boolean,
+    daysWindow: number = 3
+): Promise<EventWithPatternResponse> {
+    return invoke('add_market_event_with_pattern', {
+        symbol,
+        eventType,
+        title,
+        content,
+        date,
+        sentiment,
+        apiKey,
+        linkPattern,
+        daysWindow
+    });
+}
+
+// Open article in lightweight Tauri webview window
+export async function openArticleWindow(url: string, title: string): Promise<void> {
+    return invoke('open_article_window', { url, title });
+}

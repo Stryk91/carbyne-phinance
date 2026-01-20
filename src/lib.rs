@@ -38,6 +38,7 @@ pub mod trends;
 pub mod vectors;
 pub mod yahoo;
 pub mod claude;
+pub mod finnhub;
 
 // Re-exports for convenience
 pub use db::Database;
@@ -60,3 +61,4 @@ pub use trends::{GoogleTrends, TrendData};
 pub use vectors::{VectorStore, MarketEvent, PricePattern, SearchResult as VectorSearchResult, ChatMessage, ChatResponse};
 pub use yahoo::YahooFinance;
 pub use claude::{ClaudeClient, ClaudeMessage, ChatResult, FinancialContext, PriceContext};
+pub use finnhub::{FinnhubClient, NewsItem, SimpleNewsItem, Quote, Candles, PriceReaction};

@@ -370,8 +370,13 @@
                             </div>
 
                             <div class="ai-search-input">
-                                <input type="text" id="ai-search-query" placeholder="Search market events, patterns, news... (e.g., 'bullish earnings report')" />
+                                <input type="text" id="ai-search-query" placeholder="Search events or enter symbol (e.g., NVDA)" />
                                 <button id="ai-search-btn">Search</button>
+                                <button id="fetch-news-btn" title="Fetch latest news for symbol and populate form">Fetch News</button>
+                            </div>
+                            <div class="api-key-row" style="margin-top: 8px;">
+                                <input type="password" id="finnhub-api-key" placeholder="Finnhub API Key (free at finnhub.io)" style="flex: 1; max-width: 300px;" />
+                                <button id="save-finnhub-key-btn" style="padding: 4px 12px;">Save</button>
                             </div>
 
                             <div id="ai-search-results" class="ai-search-results">

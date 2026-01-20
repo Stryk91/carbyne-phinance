@@ -6,11 +6,24 @@ use financial_pipeline::{
     Strategy, StrategyConditionType, YahooFinance,
     VectorStore, MarketEvent, PricePattern,
     ClaudeClient, FinancialContext, PriceContext as ClaudePriceContext,
+    FinnhubClient, SimpleNewsItem, PriceReaction,
 };
 use chrono::Utc;
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::State;
+
+/// Get the absolute path to a data file
+/// Uses FP_DATA_DIR env var if set, otherwise defaults to absolute path for development
+fn get_data_path(filename: &str) -> String {
+    let base = std::env::var("FP_DATA_DIR")
+        .unwrap_or_else(|_| {
+            // Default to absolute Windows path for the app (runs as Windows exe)
+            // Note: Use Windows path format (X:\...) not WSL format (/mnt/x/...)
+            r"X:\dev\financial-pipeline-rs\data".to_string()
+        });
+    format!("{}\\{}", base, filename)
+}
 
 /// Application state holding the database connection
 struct AppState {
@@ -1687,7 +1700,7 @@ struct VectorStatsResponse {
 /// Search the vector database for relevant market events and patterns
 #[tauri::command]
 fn vector_search(query: String, limit: usize) -> Result<Vec<VectorSearchResponse>, String> {
-    let store = VectorStore::new("../data/vectors.db").map_err(|e| e.to_string())?;
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
 
     let results = store.search_all(&query, limit).map_err(|e| e.to_string())?;
 
@@ -1714,10 +1727,15 @@ fn add_market_event(
     date: String,
     sentiment: Option<f32>,
 ) -> Result<CommandResult, String> {
-    let store = VectorStore::new("../data/vectors.db").map_err(|e| e.to_string())?;
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
+
+    // Generate deterministic ID from content - same article always gets same ID
+    // This allows INSERT OR REPLACE to work correctly and prevent duplicates
+    let title_hash: u32 = title.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
+    let content_hash: u32 = content.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
 
     let event = MarketEvent {
-        id: format!("{}-{}-{}", symbol, event_type, date),
+        id: format!("{}-{}-{}-{:x}{:x}", symbol, event_type, date, title_hash, content_hash),
         symbol,
         event_type,
         title,
@@ -1746,7 +1764,7 @@ fn add_price_pattern(
     volume_change_percent: f32,
     description: String,
 ) -> Result<CommandResult, String> {
-    let store = VectorStore::new("../data/vectors.db").map_err(|e| e.to_string())?;
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
 
     let pattern = PricePattern {
         id: format!("{}-{}-{}", symbol, pattern_type, start_date),
@@ -1767,10 +1785,126 @@ fn add_price_pattern(
     })
 }
 
+/// Response for add_market_event_with_pattern command
+#[derive(Serialize)]
+struct EventWithPatternResponse {
+    success: bool,
+    message: String,
+    event_id: String,
+    pattern_id: Option<String>,
+    price_change_percent: Option<f64>,
+}
+
+/// Add a market event with an auto-linked price pattern
+/// If api_key is provided and link_pattern is true, fetches price data around the event
+/// and creates a linked pattern showing the price reaction
+#[tauri::command]
+fn add_market_event_with_pattern(
+    symbol: String,
+    event_type: String,
+    title: String,
+    content: String,
+    date: String,
+    sentiment: Option<f32>,
+    api_key: Option<String>,
+    link_pattern: bool,
+    days_window: Option<i64>,
+) -> Result<EventWithPatternResponse, String> {
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
+
+    // Generate deterministic ID from content
+    let title_hash: u32 = title.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
+    let content_hash: u32 = content.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
+    let event_id = format!("{}-{}-{}-{:x}{:x}", symbol, event_type, date, title_hash, content_hash);
+
+    // Create and store the event
+    let event = MarketEvent {
+        id: event_id.clone(),
+        symbol: symbol.clone(),
+        event_type: event_type.clone(),
+        title: title.clone(),
+        content,
+        date: date.clone(),
+        sentiment,
+        metadata: None,
+    };
+
+    store.add_market_event(&event).map_err(|e| e.to_string())?;
+
+    // If link_pattern is true and we have an API key, fetch price reaction
+    let mut pattern_id = None;
+    let mut price_change = None;
+
+    if link_pattern {
+        if let Some(key) = api_key {
+            if !key.is_empty() {
+                match FinnhubClient::new(key) {
+                    Ok(client) => {
+                        let window = days_window.unwrap_or(3);
+                        match client.fetch_price_reaction(&symbol, &date, window) {
+                            Ok(reaction) => {
+                                // Create linked pattern
+                                let pid = format!("news-reaction-{}", event_id);
+                                let pattern = PricePattern {
+                                    id: pid.clone(),
+                                    symbol: symbol.clone(),
+                                    pattern_type: "news_reaction".to_string(),
+                                    start_date: reaction.start_date,
+                                    end_date: reaction.end_date,
+                                    price_change_percent: reaction.price_change_percent as f32,
+                                    volume_change_percent: reaction.volume_change_percent as f32,
+                                    description: format!(
+                                        "Price reaction to: {} | Pre: ${:.2} → Post: ${:.2} ({:+.2}%)",
+                                        title,
+                                        reaction.pre_price,
+                                        reaction.post_price,
+                                        reaction.price_change_percent
+                                    ),
+                                };
+
+                                if store.add_price_pattern(&pattern).is_ok() {
+                                    pattern_id = Some(pid);
+                                    price_change = Some(reaction.price_change_percent);
+                                }
+                            }
+                            Err(e) => {
+                                // Log but don't fail - event was still saved
+                                eprintln!("Warning: Could not fetch price reaction: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Invalid Finnhub API key: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    let message = if let Some(ref pid) = pattern_id {
+        format!(
+            "Event saved with linked pattern (price change: {:+.2}%)",
+            price_change.unwrap_or(0.0)
+        )
+    } else if link_pattern {
+        "Event saved (pattern linking failed - check API key or date range)".to_string()
+    } else {
+        "Market event added to vector database".to_string()
+    };
+
+    Ok(EventWithPatternResponse {
+        success: true,
+        message,
+        event_id,
+        pattern_id,
+        price_change_percent: price_change,
+    })
+}
+
 /// Get vector database statistics
 #[tauri::command]
 fn get_vector_stats() -> Result<VectorStatsResponse, String> {
-    let store = VectorStore::new("../data/vectors.db").map_err(|e| e.to_string())?;
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
 
     let (events_count, patterns_count) = store.get_stats().map_err(|e| e.to_string())?;
 
@@ -1854,7 +1988,7 @@ fn claude_chat(
         .map_err(|e| e.to_string())?;
 
     // Store the conversation in vector database for future reference
-    let store = VectorStore::new("../data/vectors.db").map_err(|e| e.to_string())?;
+    let store = VectorStore::new(&get_data_path("vectors.db")).map_err(|e| e.to_string())?;
 
     let event = MarketEvent {
         id: format!("chat-{}", result.conversation_id),
@@ -1901,11 +2035,142 @@ fn claude_query(
     })
 }
 
+/// Response for fetch_news command
+#[derive(Serialize)]
+struct FetchNewsResponse {
+    news: Vec<SimpleNewsItem>,
+    count: usize,
+}
+
+/// Fetch news for a symbol from Finnhub API
+#[tauri::command]
+fn fetch_news(
+    symbol: String,
+    api_key: String,
+    limit: Option<usize>,
+) -> Result<FetchNewsResponse, String> {
+    if api_key.is_empty() {
+        return Err("Finnhub API key is required. Get one free at https://finnhub.io".to_string());
+    }
+
+    let client = FinnhubClient::new(api_key)
+        .map_err(|e| e.to_string())?;
+
+    let news_limit = limit.unwrap_or(5);
+    let news = client.fetch_simple_news(&symbol, news_limit)
+        .map_err(|e| e.to_string())?;
+
+    let count = news.len();
+
+    Ok(FetchNewsResponse { news, count })
+}
+
+/// Response for price reaction command
+#[derive(Serialize)]
+struct PriceReactionResponse {
+    symbol: String,
+    event_date: String,
+    start_date: String,
+    end_date: String,
+    pre_price: f64,
+    post_price: f64,
+    price_change_percent: f64,
+    volume_change_percent: f64,
+    candle_count: usize,
+}
+
+/// Fetch price reaction around an event date
+/// Returns price change from days_before to days_after the event
+#[tauri::command]
+fn fetch_price_reaction(
+    symbol: String,
+    event_date: String,
+    api_key: String,
+    days_window: Option<i64>,
+) -> Result<PriceReactionResponse, String> {
+    if api_key.is_empty() {
+        return Err("Finnhub API key is required".to_string());
+    }
+
+    let client = FinnhubClient::new(api_key)
+        .map_err(|e| e.to_string())?;
+
+    let window = days_window.unwrap_or(3);
+    let reaction = client.fetch_price_reaction(&symbol, &event_date, window)
+        .map_err(|e| e.to_string())?;
+
+    Ok(PriceReactionResponse {
+        symbol: reaction.symbol,
+        event_date: reaction.event_date,
+        start_date: reaction.start_date,
+        end_date: reaction.end_date,
+        pre_price: reaction.pre_price,
+        post_price: reaction.post_price,
+        price_change_percent: reaction.price_change_percent,
+        volume_change_percent: reaction.volume_change_percent,
+        candle_count: reaction.candle_count,
+    })
+}
+
+/// Open a URL in a lightweight Tauri webview window
+/// Security: Only HTTPS allowed, JavaScript sandboxed, reuses single window to save RAM
+#[tauri::command]
+async fn open_article_window(app: tauri::AppHandle, url: String, title: String) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder, Manager};
+
+    // SECURITY: Only allow HTTPS URLs (no HTTP, no file://, no javascript:, etc.)
+    let parsed_url: url::Url = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
+    if parsed_url.scheme() != "https" {
+        return Err("Only HTTPS URLs are allowed for security".to_string());
+    }
+
+    // SECURITY: Block potentially dangerous domains (can expand this list)
+    let host = parsed_url.host_str().unwrap_or("");
+    let blocked_patterns = ["localhost", "127.0.0.1", "0.0.0.0", "file://"];
+    for pattern in blocked_patterns {
+        if host.contains(pattern) {
+            return Err("This URL is not allowed for security reasons".to_string());
+        }
+    }
+
+    // Truncate title for window
+    let window_title = if title.len() > 60 {
+        format!("{}...", &title[..57])
+    } else {
+        title
+    };
+
+    // PERFORMANCE: Reuse single article-viewer window to reduce RAM usage
+    // Close existing article window if it exists
+    const ARTICLE_WINDOW_LABEL: &str = "article-viewer";
+    if let Some(existing) = app.get_webview_window(ARTICLE_WINDOW_LABEL) {
+        let _ = existing.close();
+        // Small delay to ensure window closes
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    WebviewWindowBuilder::new(
+        &app,
+        ARTICLE_WINDOW_LABEL,
+        WebviewUrl::External(parsed_url),
+    )
+    .title(&window_title)
+    .inner_size(1000.0, 700.0)
+    .min_inner_size(600.0, 400.0)
+    .center()
+    // SECURITY: Disable devtools in production
+    .devtools(cfg!(debug_assertions))
+    .build()
+    .map_err(|e| format!("Failed to create window: {}", e))?;
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize database
-    // Use path outside src-tauri to avoid triggering hot-reload on DB changes
-    let db = Database::open("../data/finance.db").expect("Failed to open database");
+    // Initialize database with absolute path to avoid CWD issues
+    let db_path = get_data_path("finance.db");
+    let db = Database::open(&db_path).expect("Failed to open database");
     db.init_schema().expect("Failed to initialize schema");
 
     tauri::Builder::default()
@@ -1969,6 +2234,13 @@ pub fn run() {
             // Claude AI commands
             claude_chat,
             claude_query,
+            // Finnhub news commands
+            fetch_news,
+            fetch_price_reaction,
+            // Enhanced event saving with pattern linking
+            add_market_event_with_pattern,
+            // Article viewer
+            open_article_window,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
