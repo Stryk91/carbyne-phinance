@@ -91,3 +91,4 @@ qt-app/target
 *secret*
 tauri-app/dist/
 data/vectors.db
+tauri-app/src-tauri/tauri.conf.local.json

@@ -5,7 +5,7 @@
   "identifier": "com.stryk.financial-pipeline",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://10.0.134.178:1420",
+    "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },
