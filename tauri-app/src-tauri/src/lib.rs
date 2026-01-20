@@ -2112,6 +2112,76 @@ fn fetch_price_reaction(
     })
 }
 
+/// Response for fetch_candles command - raw OHLCV data
+#[derive(Serialize)]
+struct CandleDataResponse {
+    symbol: String,
+    close: Vec<f64>,
+    high: Vec<f64>,
+    low: Vec<f64>,
+    open: Vec<f64>,
+    volume: Vec<i64>,
+    timestamp: Vec<i64>,
+    dates: Vec<String>,  // Human-readable dates (YYYY-MM-DD)
+}
+
+/// Fetch OHLCV candle data for a symbol and date range
+/// Returns raw candle data for charting and analysis
+#[tauri::command]
+fn fetch_candles(
+    symbol: String,
+    from_date: String,
+    to_date: String,
+    api_key: String,
+    resolution: Option<String>,
+) -> Result<CandleDataResponse, String> {
+    if api_key.is_empty() {
+        return Err("Finnhub API key is required".to_string());
+    }
+
+    use chrono::NaiveDate;
+
+    let from = NaiveDate::parse_from_str(&from_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid from_date: {}", e))?;
+    let to = NaiveDate::parse_from_str(&to_date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid to_date: {}", e))?;
+
+    let from_ts = from.and_hms_opt(0, 0, 0)
+        .ok_or("Failed to create start timestamp")?
+        .and_utc()
+        .timestamp();
+    let to_ts = to.and_hms_opt(23, 59, 59)
+        .ok_or("Failed to create end timestamp")?
+        .and_utc()
+        .timestamp();
+
+    let client = FinnhubClient::new(api_key)
+        .map_err(|e| e.to_string())?;
+
+    let res = resolution.unwrap_or_else(|| "D".to_string());
+    let candles = client.fetch_candles(&symbol, &res, from_ts, to_ts)
+        .map_err(|e| e.to_string())?;
+
+    // Convert timestamps to human-readable dates
+    let dates: Vec<String> = candles.timestamp.iter()
+        .filter_map(|&ts| {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+        })
+        .collect();
+
+    Ok(CandleDataResponse {
+        symbol: symbol.to_uppercase(),
+        close: candles.close,
+        high: candles.high,
+        low: candles.low,
+        open: candles.open,
+        volume: candles.volume,
+        timestamp: candles.timestamp,
+        dates,
+    })
+}
+
 /// Open a URL in a lightweight Tauri webview window
 /// Security: Only HTTPS allowed, JavaScript sandboxed, reuses single window to save RAM
 #[tauri::command]
@@ -2237,6 +2307,7 @@ pub fn run() {
             // Finnhub news commands
             fetch_news,
             fetch_price_reaction,
+            fetch_candles,
             // Enhanced event saving with pattern linking
             add_market_event_with_pattern,
             // Article viewer

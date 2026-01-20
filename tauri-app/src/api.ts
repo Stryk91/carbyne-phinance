@@ -321,6 +321,28 @@ export async function fetchPriceReaction(
     return invoke('fetch_price_reaction', { symbol, eventDate, apiKey, daysWindow });
 }
 
+// Raw candle data
+export interface CandleDataResponse {
+    symbol: string;
+    close: number[];
+    high: number[];
+    low: number[];
+    open: number[];
+    volume: number[];
+    timestamp: number[];
+    dates: string[];  // YYYY-MM-DD format
+}
+
+export async function fetchCandles(
+    symbol: string,
+    fromDate: string,
+    toDate: string,
+    apiKey: string,
+    resolution: string = 'D'
+): Promise<CandleDataResponse> {
+    return invoke('fetch_candles', { symbol, fromDate, toDate, apiKey, resolution });
+}
+
 // Enhanced event saving with pattern linking
 export interface EventWithPatternResponse {
     success: boolean;

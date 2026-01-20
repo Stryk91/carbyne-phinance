@@ -1256,6 +1256,16 @@ const FINNHUB_API_KEY_STORAGE = 'fp_finnhub_api_key';
 // Store fetched news for "Save All" functionality
 let fetchedNewsItems: api.SimpleNewsItem[] = [];
 
+// Store candle data for news date display (date -> {close, open, change%})
+interface DayCandle {
+    close: number;
+    open: number;
+    high: number;
+    low: number;
+    dailyChangePercent: number;  // (close - open) / open * 100
+}
+let fetchedCandlesByDate: Map<string, DayCandle> = new Map();
+
 function loadFinnhubApiKey(): void {
     const savedKey = localStorage.getItem(FINNHUB_API_KEY_STORAGE);
     const keyInput = document.getElementById('finnhub-api-key') as HTMLInputElement;
@@ -1311,11 +1321,59 @@ async function fetchNewsAndPopulateForm(): Promise<void> {
         if (response.count === 0) {
             resultsDiv.innerHTML = `<p class="empty-state">No recent news found for ${escapeHtml(symbol)}.</p>`;
             fetchedNewsItems = [];
+            fetchedCandlesByDate.clear();
             return;
         }
 
         // Store news items for Save All functionality
         fetchedNewsItems = response.news;
+
+        // Fetch price data for news dates - try local Yahoo data first, then Finnhub
+        fetchedCandlesByDate.clear();
+        const dates = response.news.map(n => n.date).sort();
+
+        try {
+            resultsDiv.innerHTML = `<p>Fetching price data for ${escapeHtml(symbol)}...</p>`;
+
+            // Try local price history first (Yahoo data already fetched)
+            const localPrices = await api.getPriceHistory(symbol);
+            if (localPrices && localPrices.length > 0) {
+                log(`Using local Yahoo price data (${localPrices.length} days)`, 'info');
+                for (const p of localPrices) {
+                    const dailyChangePercent = p.open > 0 ? ((p.close - p.open) / p.open) * 100 : 0;
+                    fetchedCandlesByDate.set(p.date, {
+                        close: p.close,
+                        open: p.open,
+                        high: p.high,
+                        low: p.low,
+                        dailyChangePercent
+                    });
+                }
+                log(`Loaded ${fetchedCandlesByDate.size} days of local price data`, 'info');
+            } else {
+                // Fall back to Finnhub candles if no local data
+                log(`No local data, trying Finnhub candles...`, 'info');
+                const minDate = dates[0];
+                const maxDate = dates[dates.length - 1];
+                const candles = await api.fetchCandles(symbol, minDate, maxDate, apiKey);
+                for (let i = 0; i < candles.dates.length; i++) {
+                    const open = candles.open[i];
+                    const close = candles.close[i];
+                    const dailyChangePercent = open > 0 ? ((close - open) / open) * 100 : 0;
+                    fetchedCandlesByDate.set(candles.dates[i], {
+                        close,
+                        open,
+                        high: candles.high[i],
+                        low: candles.low[i],
+                        dailyChangePercent
+                    });
+                }
+                log(`Loaded ${candles.dates.length} days from Finnhub`, 'info');
+            }
+        } catch (priceErr) {
+            log(`Could not fetch price data: ${priceErr}`, 'info');
+            // Continue without price data - it's optional
+        }
 
         // Show news items in results with Save All button and auto-link option
         resultsDiv.innerHTML = `
@@ -1328,12 +1386,34 @@ async function fetchNewsAndPopulateForm(): Promise<void> {
                     <span>Auto-link price patterns</span>
                 </label>
             </div>
-        ` + response.news.map((item, index) => `
+        ` + response.news.map((item, index) => {
+            // Get price data for this news date
+            const candle = fetchedCandlesByDate.get(item.date);
+            console.log(`News item ${index}: date=${item.date}, hasCandle=${!!candle}, mapSize=${fetchedCandlesByDate.size}`);
+            const priceHtml = candle
+                ? (() => {
+                    const change = candle.dailyChangePercent;
+                    const arrow = change > 0 ? '▲' : change < 0 ? '▼' : '–';
+                    const color = change > 0 ? '#22c55e' : change < 0 ? '#ef4444' : 'var(--text-secondary)';
+                    // Outcome-based sentiment from actual price movement
+                    const sentimentLabel = change >= 2 ? 'BULLISH' : change <= -2 ? 'BEARISH' : 'NEUTRAL';
+                    const sentimentColor = change >= 2 ? '#22c55e' : change <= -2 ? '#ef4444' : '#888';
+                    return `
+                        <span class="news-price-badge" style="margin-left: 8px; font-size: 0.85em;">
+                            <span style="color: var(--text-secondary);">$${candle.close.toFixed(2)}</span>
+                            <span style="color: ${color}; font-weight: 500;">${arrow}${Math.abs(change).toFixed(1)}%</span>
+                            <span class="sentiment-badge" style="background: ${sentimentColor}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 4px;">${sentimentLabel}</span>
+                        </span>`;
+                })()
+                : '';
+
+            return `
             <div class="ai-result-item news-item" data-index="${index}" style="border-left-color: var(--accent);">
                 <div class="ai-result-header" style="cursor: pointer;">
                     <span class="ai-result-type news">news</span>
                     <span class="ai-result-date">${escapeHtml(item.date)}</span>
                     <span class="ai-result-symbol">${escapeHtml(item.symbol)}</span>
+                    ${priceHtml}
                 </div>
                 <div class="ai-result-content" style="cursor: pointer;"><strong>${escapeHtml(item.headline)}</strong></div>
                 <div class="news-summary" data-index="${index}" style="font-size: 0.9em; color: var(--text-secondary);">
@@ -1346,7 +1426,7 @@ async function fetchNewsAndPopulateForm(): Promise<void> {
                     ${item.url ? ` | <a href="#" class="open-article-link" data-index="${index}" data-url="${escapeHtml(item.url)}" data-title="${escapeHtml(item.headline)}" style="color: var(--accent); cursor: pointer;">Open article ↗</a>` : ''}
                 </div>
             </div>
-        `).join('');
+        `}).join('');
 
         // Add Save All button handler
         document.getElementById('save-all-news-btn')?.addEventListener('click', saveAllFetchedNews);

@@ -125,8 +125,14 @@ export class TradingViewChart {
         // Sync time scales
         this.chart.timeScale().subscribeVisibleTimeRangeChange(() => {
             const range = this.chart?.timeScale().getVisibleRange();
-            if (range && this.volumeChart) {
-                this.volumeChart.timeScale().setVisibleRange(range);
+            // Guard against null/undefined range or null time values within the range
+            if (range && range.from && range.to && this.volumeChart) {
+                try {
+                    this.volumeChart.timeScale().setVisibleRange(range);
+                } catch (e) {
+                    // Ignore sync errors - can happen during chart initialization
+                    console.debug('Chart time sync skipped:', e);
+                }
             }
         });
 
