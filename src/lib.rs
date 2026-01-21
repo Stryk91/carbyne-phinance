@@ -39,6 +39,8 @@ pub mod vectors;
 pub mod yahoo;
 pub mod claude;
 pub mod finnhub;
+pub mod ollama;
+pub mod ai_trader;
 
 // Re-exports for convenience
 pub use db::Database;
@@ -54,6 +56,7 @@ pub use models::{
     IndicatorAlertCondition, IndicatorAlertType, MacroData, PerformanceMetrics, Position,
     PositionType, PriceAlert, Signal, SignalDirection, SignalType, Strategy,
     StrategyConditionType, Symbol, TechnicalIndicator, TradeDirection, Watchlist,
+    PaperWallet, PaperPosition, PaperTrade, PaperTradeAction,
 };
 pub use backtest::{BacktestConfig, BacktestEngine};
 pub use signals::{SignalConfig, SignalEngine};
@@ -62,3 +65,8 @@ pub use vectors::{VectorStore, MarketEvent, PricePattern, SearchResult as Vector
 pub use yahoo::YahooFinance;
 pub use claude::{ClaudeClient, ClaudeMessage, ChatResult, FinancialContext, PriceContext};
 pub use finnhub::{FinnhubClient, NewsItem, SimpleNewsItem, Quote, Candles, PriceReaction};
+pub use ai_trader::AiTrader;
+pub use models::{
+    AiTraderConfig, AiTradingSession, AiTradeDecision, AiPerformanceSnapshot,
+    AiPredictionAccuracy, AiTraderStatus, BenchmarkComparison, CompoundingForecast,
+};

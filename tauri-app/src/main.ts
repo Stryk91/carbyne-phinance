@@ -112,6 +112,7 @@ function switchTab(tabName: string): void {
     if (tabName === 'indicators') initializeIndicatorChart();
     if (tabName === 'groups') loadGroups();
     if (tabName === 'ai-search') loadVectorStats();
+    if (tabName === 'ai-trader') loadAiTrader();
 }
 
 // Initialize TradingView chart
@@ -1375,124 +1376,195 @@ async function fetchNewsAndPopulateForm(): Promise<void> {
             // Continue without price data - it's optional
         }
 
-        // Show news items in results with Save All button and auto-link option
+        // Common symbol to company name mappings
+        const symbolNames: Record<string, string[]> = {
+            'NVDA': ['nvidia', 'nvda'],
+            'AAPL': ['apple', 'aapl', 'iphone', 'ipad', 'mac'],
+            'GOOGL': ['google', 'googl', 'alphabet', 'youtube', 'android'],
+            'GOOG': ['google', 'goog', 'alphabet', 'youtube', 'android'],
+            'MSFT': ['microsoft', 'msft', 'windows', 'azure', 'xbox'],
+            'AMZN': ['amazon', 'amzn', 'aws', 'prime'],
+            'META': ['meta', 'facebook', 'instagram', 'whatsapp'],
+            'TSLA': ['tesla', 'tsla', 'elon musk'],
+            'AMD': ['amd', 'advanced micro'],
+            'INTC': ['intel', 'intc'],
+        };
+
+        // Helper to check if news mentions the symbol or company name
+        const mentionsSymbol = (item: api.SimpleNewsItem, sym: string): boolean => {
+            const text = (item.headline + ' ' + item.summary).toLowerCase();
+            const symLower = sym.toLowerCase();
+
+            // Check for symbol itself
+            if (text.includes(symLower)) return true;
+
+            // Check for known company names
+            const names = symbolNames[sym.toUpperCase()];
+            if (names) {
+                for (const name of names) {
+                    if (text.includes(name)) return true;
+                }
+            }
+
+            return false;
+        };
+
+        // Render news items (called on initial load and when filter changes)
+        const renderNewsItems = (filterSymbolOnly: boolean) => {
+            const newsToShow = filterSymbolOnly
+                ? response.news.filter(item => mentionsSymbol(item, symbol))
+                : response.news;
+
+            const newsListHtml = newsToShow.map((item, index) => {
+                // Get price data for this news date
+                const candle = fetchedCandlesByDate.get(item.date);
+                const priceHtml = candle
+                    ? (() => {
+                        const change = candle.dailyChangePercent;
+                        const arrow = change > 0 ? '▲' : change < 0 ? '▼' : '–';
+                        const color = change > 0 ? '#22c55e' : change < 0 ? '#ef4444' : 'var(--text-secondary)';
+                        const sentimentLabel = change >= 2 ? 'BULLISH' : change <= -2 ? 'BEARISH' : 'NEUTRAL';
+                        const sentimentColor = change >= 2 ? '#22c55e' : change <= -2 ? '#ef4444' : '#888';
+                        return `
+                            <span class="news-price-badge" style="margin-left: 8px; font-size: 0.85em;">
+                                <span style="color: var(--text-secondary);">$${candle.close.toFixed(2)}</span>
+                                <span style="color: ${color}; font-weight: 500;">${arrow}${Math.abs(change).toFixed(1)}%</span>
+                                <span class="sentiment-badge" style="background: ${sentimentColor}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 4px;">${sentimentLabel}</span>
+                            </span>`;
+                    })()
+                    : '';
+
+                // Check if this is symbol-specific or general market news
+                const isSpecific = mentionsSymbol(item, symbol);
+                const relevanceBadge = !isSpecific
+                    ? '<span style="background: #666; color: white; padding: 1px 5px; border-radius: 3px; font-size: 0.7em; margin-left: 4px;">MARKET</span>'
+                    : '';
+
+                return `
+                <div class="ai-result-item news-item" data-index="${index}" style="border-left-color: var(--accent);">
+                    <div class="ai-result-header" style="cursor: pointer;">
+                        <span class="ai-result-type news">news</span>
+                        <span class="ai-result-date">${escapeHtml(item.date)}</span>
+                        <span class="ai-result-symbol">${escapeHtml(item.symbol)}</span>
+                        ${relevanceBadge}
+                        ${priceHtml}
+                    </div>
+                    <div class="ai-result-content" style="cursor: pointer;"><strong>${escapeHtml(item.headline)}</strong></div>
+                    <div class="news-summary" data-index="${index}" style="font-size: 0.9em; color: var(--text-secondary);">
+                        <span class="summary-preview">${escapeHtml(item.summary.substring(0, 200))}${item.summary.length > 200 ? '...' : ''}</span>
+                        <span class="summary-full" style="display: none;">${escapeHtml(item.summary)}</span>
+                    </div>
+                    <div style="font-size: 0.8em; color: var(--text-secondary); margin-top: 4px;">
+                        Source: ${escapeHtml(item.source)} |
+                        <a href="#" class="read-more-link" data-index="${index}" style="color: var(--accent);">Read more ▼</a>
+                        ${item.url ? ` | <a href="#" class="open-article-link" data-index="${index}" data-url="${escapeHtml(item.url)}" data-title="${escapeHtml(item.headline)}" style="color: var(--accent); cursor: pointer;">Open article ↗</a>` : ''}
+                    </div>
+                </div>
+                `;
+            }).join('');
+
+            return { html: newsListHtml, count: newsToShow.length };
+        };
+
+        // Initial render
+        const initialRender = renderNewsItems(false);
+
+        // Show news items in results with Save All button and filter options
         resultsDiv.innerHTML = `
             <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
                 <button id="save-all-news-btn" style="background: var(--accent); color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;">
-                    Save All ${response.count} News Items
+                    Save All <span id="news-count">${response.count}</span> News Items
                 </button>
                 <label style="display: flex; align-items: center; gap: 4px; font-size: 0.9em; cursor: pointer;" title="Fetches price data around each news date and creates linked patterns showing price reaction">
                     <input type="checkbox" id="auto-link-pattern" checked style="cursor: pointer;">
-                    <span>Auto-link price patterns</span>
+                    <span>Auto-link patterns</span>
+                </label>
+                <label style="display: flex; align-items: center; gap: 4px; font-size: 0.9em; cursor: pointer;" title="Only show news that specifically mentions ${escapeHtml(symbol)}">
+                    <input type="checkbox" id="filter-symbol-only" style="cursor: pointer;">
+                    <span>${escapeHtml(symbol)}-specific only</span>
                 </label>
             </div>
-        ` + response.news.map((item, index) => {
-            // Get price data for this news date
-            const candle = fetchedCandlesByDate.get(item.date);
-            console.log(`News item ${index}: date=${item.date}, hasCandle=${!!candle}, mapSize=${fetchedCandlesByDate.size}`);
-            const priceHtml = candle
-                ? (() => {
-                    const change = candle.dailyChangePercent;
-                    const arrow = change > 0 ? '▲' : change < 0 ? '▼' : '–';
-                    const color = change > 0 ? '#22c55e' : change < 0 ? '#ef4444' : 'var(--text-secondary)';
-                    // Outcome-based sentiment from actual price movement
-                    const sentimentLabel = change >= 2 ? 'BULLISH' : change <= -2 ? 'BEARISH' : 'NEUTRAL';
-                    const sentimentColor = change >= 2 ? '#22c55e' : change <= -2 ? '#ef4444' : '#888';
-                    return `
-                        <span class="news-price-badge" style="margin-left: 8px; font-size: 0.85em;">
-                            <span style="color: var(--text-secondary);">$${candle.close.toFixed(2)}</span>
-                            <span style="color: ${color}; font-weight: 500;">${arrow}${Math.abs(change).toFixed(1)}%</span>
-                            <span class="sentiment-badge" style="background: ${sentimentColor}; color: white; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 4px;">${sentimentLabel}</span>
-                        </span>`;
-                })()
-                : '';
+            <div id="news-items-container">${initialRender.html}</div>
+        `;
 
-            return `
-            <div class="ai-result-item news-item" data-index="${index}" style="border-left-color: var(--accent);">
-                <div class="ai-result-header" style="cursor: pointer;">
-                    <span class="ai-result-type news">news</span>
-                    <span class="ai-result-date">${escapeHtml(item.date)}</span>
-                    <span class="ai-result-symbol">${escapeHtml(item.symbol)}</span>
-                    ${priceHtml}
-                </div>
-                <div class="ai-result-content" style="cursor: pointer;"><strong>${escapeHtml(item.headline)}</strong></div>
-                <div class="news-summary" data-index="${index}" style="font-size: 0.9em; color: var(--text-secondary);">
-                    <span class="summary-preview">${escapeHtml(item.summary.substring(0, 200))}${item.summary.length > 200 ? '...' : ''}</span>
-                    <span class="summary-full" style="display: none;">${escapeHtml(item.summary)}</span>
-                </div>
-                <div style="font-size: 0.8em; color: var(--text-secondary); margin-top: 4px;">
-                    Source: ${escapeHtml(item.source)} |
-                    <a href="#" class="read-more-link" data-index="${index}" style="color: var(--accent);">Read more ▼</a>
-                    ${item.url ? ` | <a href="#" class="open-article-link" data-index="${index}" data-url="${escapeHtml(item.url)}" data-title="${escapeHtml(item.headline)}" style="color: var(--accent); cursor: pointer;">Open article ↗</a>` : ''}
-                </div>
-            </div>
-        `}).join('');
+        // Add filter toggle handler
+        document.getElementById('filter-symbol-only')?.addEventListener('change', (e) => {
+            const filterOn = (e.target as HTMLInputElement).checked;
+            const rendered = renderNewsItems(filterOn);
+            document.getElementById('news-items-container')!.innerHTML = rendered.html;
+            document.getElementById('news-count')!.textContent = rendered.count.toString();
+            // Re-attach event handlers
+            attachNewsEventHandlers();
+            log(`Showing ${rendered.count} news items (filter: ${filterOn ? 'symbol-specific' : 'all'})`, 'info');
+        });
+
+        // Function to attach event handlers to news items
+        const attachNewsEventHandlers = () => {
+            // Click handlers for news items (to populate form)
+            resultsDiv.querySelectorAll('.news-item .ai-result-header, .news-item .ai-result-content').forEach((elem) => {
+                elem.addEventListener('click', (e) => {
+                    const newsItem = (e.currentTarget as HTMLElement).closest('.news-item');
+                    const index = parseInt(newsItem?.getAttribute('data-index') || '0');
+                    populateEventFormFromNews(response.news[index]);
+                });
+            });
+
+            // Read More handlers
+            resultsDiv.querySelectorAll('.read-more-link').forEach((link) => {
+                link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const index = (e.currentTarget as HTMLElement).getAttribute('data-index');
+                    const summaryDiv = resultsDiv.querySelector(`.news-summary[data-index="${index}"]`);
+                    const preview = summaryDiv?.querySelector('.summary-preview') as HTMLElement;
+                    const full = summaryDiv?.querySelector('.summary-full') as HTMLElement;
+                    const linkElem = e.currentTarget as HTMLElement;
+                    if (preview && full) {
+                        if (full.style.display === 'none') {
+                            preview.style.display = 'none';
+                            full.style.display = 'inline';
+                            linkElem.textContent = 'Show less ▲';
+                        } else {
+                            preview.style.display = 'inline';
+                            full.style.display = 'none';
+                            linkElem.textContent = 'Read more ▼';
+                        }
+                    }
+                });
+            });
+
+            // Open Article handlers
+            resultsDiv.querySelectorAll('.open-article-link').forEach((link) => {
+                link.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const url = (e.currentTarget as HTMLElement).getAttribute('data-url');
+                    const title = (e.currentTarget as HTMLElement).getAttribute('data-title');
+                    if (url && title) {
+                        try {
+                            await api.openArticleWindow(url, title);
+                        } catch (err) {
+                            log(`Failed to open article: ${err}`, 'error');
+                            window.open(url, '_blank');
+                        }
+                    }
+                });
+            });
+        };
+
+        // Initial event handler attachment
+        attachNewsEventHandlers();
 
         // Add Save All button handler
         document.getElementById('save-all-news-btn')?.addEventListener('click', saveAllFetchedNews);
 
-        // Add click handlers for news items (to populate form)
-        resultsDiv.querySelectorAll('.news-item .ai-result-header, .news-item .ai-result-content').forEach((elem) => {
-            elem.addEventListener('click', (e) => {
-                const newsItem = (e.currentTarget as HTMLElement).closest('.news-item');
-                const index = parseInt(newsItem?.getAttribute('data-index') || '0');
-                populateEventFormFromNews(response.news[index]);
-            });
-        });
-
-        // Add Read More handlers (expand/collapse)
-        resultsDiv.querySelectorAll('.read-more-link').forEach((link) => {
-            link.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const index = (e.currentTarget as HTMLElement).getAttribute('data-index');
-                const summaryDiv = resultsDiv.querySelector(`.news-summary[data-index="${index}"]`);
-                const preview = summaryDiv?.querySelector('.summary-preview') as HTMLElement;
-                const full = summaryDiv?.querySelector('.summary-full') as HTMLElement;
-                const linkElem = e.currentTarget as HTMLElement;
-
-                if (preview && full) {
-                    if (full.style.display === 'none') {
-                        preview.style.display = 'none';
-                        full.style.display = 'inline';
-                        linkElem.textContent = 'Show less ▲';
-                    } else {
-                        preview.style.display = 'inline';
-                        full.style.display = 'none';
-                        linkElem.textContent = 'Read more ▼';
-                    }
-                }
-            });
-        });
-
-        // Add Open Article handlers (open in Tauri webview window)
-        resultsDiv.querySelectorAll('.open-article-link').forEach((link) => {
-            link.addEventListener('click', async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const elem = e.currentTarget as HTMLElement;
-                const url = elem.getAttribute('data-url');
-                const title = elem.getAttribute('data-title') || 'Article';
-
-                if (url) {
-                    try {
-                        log(`Opening article: ${title.substring(0, 50)}...`, 'info');
-                        await api.openArticleWindow(url, title);
-                    } catch (error) {
-                        log(`Failed to open article: ${error}`, 'error');
-                        // Fallback: try opening in system browser
-                        window.open(url, '_blank');
-                    }
-                }
-            });
-        });
-
         log(`Found ${response.count} news items for ${symbol}. Click one to populate the form, or Save All.`, 'success');
-    } catch (error) {
-        resultsDiv.innerHTML = `<p class="empty-state error">Error: ${escapeHtml(String(error))}</p>`;
-        log(`News fetch error: ${error}`, 'error');
+    } catch (err) {
+        resultsDiv.innerHTML = `<p class="error">Error fetching news: ${err}</p>`;
+        log(`Failed to fetch news: ${err}`, 'error');
     }
 }
+
 
 function populateEventFormFromNews(news: api.SimpleNewsItem): void {
     // Populate the market event form fields
@@ -1553,8 +1625,9 @@ async function saveAllFetchedNews(): Promise<void> {
                         patternsLinked++;
                         log(`${news.symbol}: ${result.price_change_percent?.toFixed(2)}% price change`, 'info');
                     } else {
-                        // Pattern linking failed - show why
-                        log(`${news.symbol}: Event saved, pattern failed: ${result.message}`, 'info');
+                        // Pattern linking failed - show actual error
+                        const errorDetail = result.pattern_error || result.message;
+                        log(`${news.symbol}: Event saved, pattern failed: ${errorDetail}`, 'info');
                     }
                 } else {
                     errorCount++;
@@ -1606,6 +1679,309 @@ async function saveAllFetchedNews(): Promise<void> {
 
     // Clear the stored items to prevent double-saving
     fetchedNewsItems = [];
+}
+
+// ============================================================================
+// AI TRADER FUNCTIONS
+// ============================================================================
+
+let aiPerformanceChart: any = null;
+
+async function loadAiTrader(): Promise<void> {
+    try {
+        // Load status
+        const status = await api.aiTraderGetStatus();
+        updateAiTraderStatus(status);
+
+        // Load decisions
+        const decisions = await api.aiTraderGetDecisions(undefined, undefined, 50);
+        updateAiDecisionLog(decisions);
+
+        // Load forecast
+        try {
+            const forecast = await api.aiTraderGetCompoundingForecast();
+            updateAiForecast(forecast);
+        } catch (e) {
+            // Forecast may fail if no data yet
+        }
+
+        // Load accuracy
+        try {
+            const accuracy = await api.aiTraderGetPredictionAccuracy();
+            updateAiAccuracy(accuracy);
+        } catch (e) {
+            // Accuracy may fail if no predictions yet
+        }
+
+        // Load benchmark comparison
+        try {
+            const benchmark = await api.aiTraderGetBenchmarkComparison();
+            updateAiBenchmark(benchmark);
+        } catch (e) {
+            // Benchmark may fail if no data yet
+        }
+
+        log('AI Trader data loaded', 'success');
+    } catch (error) {
+        log(`Error loading AI Trader: ${error}`, 'error');
+    }
+}
+
+function updateAiTraderStatus(status: api.AiTraderStatus): void {
+    const container = document.querySelector('.ai-trader-container');
+    if (container) {
+        container.classList.toggle('bankrupt', status.is_bankrupt);
+    }
+
+    // Update values
+    const portfolioEl = document.getElementById('ai-portfolio-value');
+    const changeEl = document.getElementById('ai-portfolio-change');
+    const cashEl = document.getElementById('ai-cash');
+    const positionsEl = document.getElementById('ai-positions-value');
+    const sessionEl = document.getElementById('ai-session-status');
+    const sessionsCountEl = document.getElementById('ai-sessions-count');
+    const decisionsCountEl = document.getElementById('ai-decisions-count');
+    const tradesCountEl = document.getElementById('ai-trades-count');
+
+    if (portfolioEl) portfolioEl.textContent = `$${status.portfolio_value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (cashEl) cashEl.textContent = `$${status.cash.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (positionsEl) positionsEl.textContent = `$${status.positions_value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+    // Calculate change from $1M
+    const pnlPercent = ((status.portfolio_value - 1000000) / 1000000) * 100;
+    if (changeEl) {
+        const sign = pnlPercent >= 0 ? '+' : '';
+        changeEl.textContent = `${sign}${pnlPercent.toFixed(2)}%`;
+        changeEl.className = 'ai-stat-change ' + (pnlPercent >= 0 ? 'positive' : 'negative');
+    }
+
+    // Session status
+    if (sessionEl) {
+        if (status.is_bankrupt) {
+            sessionEl.textContent = 'BANKRUPT';
+            sessionEl.style.color = 'var(--error)';
+        } else if (status.is_running) {
+            sessionEl.textContent = 'Active';
+            sessionEl.style.color = 'var(--success)';
+        } else {
+            sessionEl.textContent = 'Inactive';
+            sessionEl.style.color = 'var(--text-secondary)';
+        }
+    }
+
+    // Stats
+    if (sessionsCountEl) sessionsCountEl.textContent = status.sessions_completed.toString();
+    if (decisionsCountEl) decisionsCountEl.textContent = status.total_decisions.toString();
+    if (tradesCountEl) tradesCountEl.textContent = status.total_trades.toString();
+
+    // Update button states
+    const startBtn = document.getElementById('ai-start-session-btn') as HTMLButtonElement;
+    const endBtn = document.getElementById('ai-end-session-btn') as HTMLButtonElement;
+    const runBtn = document.getElementById('ai-run-cycle-btn') as HTMLButtonElement;
+
+    if (startBtn && endBtn && runBtn) {
+        startBtn.disabled = status.is_running || status.is_bankrupt;
+        endBtn.disabled = !status.is_running;
+        runBtn.disabled = !status.is_running;
+    }
+}
+
+function updateAiDecisionLog(decisions: api.AiTradeDecision[]): void {
+    const logEl = document.getElementById('ai-decision-log');
+    if (!logEl) return;
+
+    if (decisions.length === 0) {
+        logEl.innerHTML = '<div class="empty-state">No decisions yet. Start a session and run a cycle.</div>';
+        return;
+    }
+
+    logEl.innerHTML = decisions.map(d => {
+        const actionClass = d.action.toLowerCase();
+        const time = new Date(d.timestamp).toLocaleTimeString();
+        const date = new Date(d.timestamp).toLocaleDateString();
+        const qty = d.quantity ? d.quantity.toFixed(0) : '';
+        const price = d.price_at_decision ? `@$${d.price_at_decision.toFixed(2)}` : '';
+        const prediction = d.predicted_direction && d.predicted_price_target
+            ? `Prediction: ${d.predicted_direction} to $${d.predicted_price_target.toFixed(2)} in ${d.predicted_timeframe_days}d`
+            : '';
+        const accuracyBadge = d.prediction_accurate !== null
+            ? `<span style="color: ${d.prediction_accurate ? 'var(--success)' : 'var(--error)'};">${d.prediction_accurate ? 'Correct' : 'Wrong'}</span>`
+            : '';
+
+        return `
+            <div class="ai-decision-item">
+                <div class="ai-decision-header">
+                    <div>
+                        <span class="ai-decision-action ${actionClass}">${escapeHtml(d.action)}</span>
+                        <span class="ai-decision-symbol">${escapeHtml(d.symbol)}</span>
+                        <span class="ai-decision-details">${qty} ${price}</span>
+                    </div>
+                    <div class="ai-decision-confidence">Conf: ${(d.confidence * 100).toFixed(0)}%</div>
+                </div>
+                <div class="ai-decision-reasoning">${escapeHtml(d.reasoning.substring(0, 300))}${d.reasoning.length > 300 ? '...' : ''}</div>
+                ${prediction ? `<div class="ai-decision-prediction">${escapeHtml(prediction)} ${accuracyBadge}</div>` : ''}
+                <div class="ai-decision-timestamp">${date} ${time} | ${escapeHtml(d.model_used)}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+function updateAiForecast(forecast: api.AiCompoundingForecast): void {
+    const dailyEl = document.getElementById('ai-daily-return');
+    const winRateEl = document.getElementById('ai-win-rate');
+    const proj30El = document.getElementById('ai-proj-30d');
+    const proj90El = document.getElementById('ai-proj-90d');
+    const proj1yEl = document.getElementById('ai-proj-1y');
+    const doubleEl = document.getElementById('ai-time-to-double');
+    const bankruptEl = document.getElementById('ai-bankruptcy-risk');
+
+    if (dailyEl) {
+        const sign = forecast.current_daily_return >= 0 ? '+' : '';
+        dailyEl.textContent = `${sign}${(forecast.current_daily_return * 100).toFixed(3)}%`;
+        dailyEl.style.color = forecast.current_daily_return >= 0 ? 'var(--success)' : 'var(--error)';
+    }
+    if (winRateEl) winRateEl.textContent = `${(forecast.current_win_rate * 100).toFixed(0)}%`;
+    if (proj30El) proj30El.textContent = `$${forecast.projected_30_days.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    if (proj90El) proj90El.textContent = `$${forecast.projected_90_days.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    if (proj1yEl) proj1yEl.textContent = `$${forecast.projected_365_days.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    if (doubleEl) doubleEl.textContent = forecast.time_to_double ? `${forecast.time_to_double} days` : 'N/A';
+    if (bankruptEl) bankruptEl.textContent = forecast.time_to_bankruptcy ? `${forecast.time_to_bankruptcy} days` : 'Low';
+}
+
+function updateAiAccuracy(accuracy: api.AiPredictionAccuracy): void {
+    const pctEl = document.getElementById('ai-accuracy-pct');
+    const countEl = document.getElementById('ai-predictions-count');
+    const correctEl = document.getElementById('ai-correct-count');
+
+    if (pctEl) pctEl.textContent = `${accuracy.accuracy_percent.toFixed(0)}%`;
+    if (countEl) countEl.textContent = `${accuracy.total_predictions} predictions evaluated`;
+    if (correctEl) correctEl.textContent = `${accuracy.accurate_predictions} correct`;
+}
+
+function updateAiBenchmark(benchmark: api.AiBenchmarkComparison): void {
+    const alphaEl = document.getElementById('ai-alpha');
+    if (alphaEl) {
+        const sign = benchmark.alpha >= 0 ? '+' : '';
+        alphaEl.textContent = `${sign}${benchmark.alpha.toFixed(2)}%`;
+        alphaEl.style.color = benchmark.alpha >= 0 ? 'var(--success)' : 'var(--error)';
+    }
+
+    // Update performance chart if we have data
+    if (benchmark.tracking_data && benchmark.tracking_data.length > 0) {
+        updateAiPerformanceChart(benchmark.tracking_data);
+    }
+}
+
+function updateAiPerformanceChart(data: [string, number, number][]): void {
+    const chartEl = document.getElementById('ai-performance-chart');
+    if (!chartEl) return;
+
+    // For now, just show text summary. Full chart would use lightweight-charts
+    if (data.length < 2) {
+        chartEl.innerHTML = '<div class="empty-state" style="padding: 100px;">Not enough data for chart. Run more cycles to see performance.</div>';
+        return;
+    }
+
+    const latest = data[data.length - 1];
+    const portfolioReturn = ((latest[1] - 1000000) / 1000000 * 100).toFixed(2);
+    const benchmarkReturn = ((latest[2] - 1000000) / 1000000 * 100).toFixed(2);
+
+    chartEl.innerHTML = `
+        <div style="padding: 20px; text-align: center;">
+            <div style="display: flex; justify-content: center; gap: 40px; margin-bottom: 20px;">
+                <div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary);">Portfolio Return</div>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: ${parseFloat(portfolioReturn) >= 0 ? 'var(--success)' : 'var(--error)'};">${parseFloat(portfolioReturn) >= 0 ? '+' : ''}${portfolioReturn}%</div>
+                </div>
+                <div>
+                    <div style="font-size: 0.8rem; color: var(--text-secondary);">SPY Benchmark</div>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: ${parseFloat(benchmarkReturn) >= 0 ? 'var(--success)' : 'var(--error)'};">${parseFloat(benchmarkReturn) >= 0 ? '+' : ''}${benchmarkReturn}%</div>
+                </div>
+            </div>
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">${data.length} data points | Latest: ${new Date(latest[0]).toLocaleString()}</div>
+        </div>
+    `;
+}
+
+async function aiStartSession(): Promise<void> {
+    try {
+        log('Starting AI trading session...', 'info');
+        const session = await api.aiTraderStartSession();
+        log(`AI session ${session.id} started`, 'success');
+        await loadAiTrader();
+    } catch (error) {
+        log(`Error starting session: ${error}`, 'error');
+    }
+}
+
+async function aiEndSession(): Promise<void> {
+    try {
+        log('Ending AI trading session...', 'info');
+        const session = await api.aiTraderEndSession();
+        if (session) {
+            log(`AI session ${session.id} ended`, 'success');
+        }
+        await loadAiTrader();
+    } catch (error) {
+        log(`Error ending session: ${error}`, 'error');
+    }
+}
+
+async function aiRunCycle(): Promise<void> {
+    const runBtn = document.getElementById('ai-run-cycle-btn') as HTMLButtonElement;
+    const modelStatus = document.getElementById('ai-model-status');
+
+    try {
+        if (runBtn) runBtn.disabled = true;
+        if (modelStatus) modelStatus.textContent = 'Running AI cycle...';
+
+        log('Running AI trading cycle...', 'info');
+        const decisions = await api.aiTraderRunCycle();
+        log(`AI cycle completed: ${decisions.length} decisions made`, 'success');
+
+        if (modelStatus) {
+            if (decisions.length > 0) {
+                modelStatus.textContent = `Last: ${decisions[0].model_used}`;
+            } else {
+                modelStatus.textContent = 'Cycle complete - no actions';
+            }
+        }
+
+        await loadAiTrader();
+    } catch (error) {
+        log(`Error running cycle: ${error}`, 'error');
+        if (modelStatus) modelStatus.textContent = `Error: ${error}`;
+    } finally {
+        // Re-enable based on status
+        const status = await api.aiTraderGetStatus();
+        if (runBtn) runBtn.disabled = !status.is_running;
+    }
+}
+
+async function aiReset(): Promise<void> {
+    if (!confirm('Reset AI trading? This will clear all sessions, decisions, and reset to $1,000,000.')) {
+        return;
+    }
+
+    try {
+        log('Resetting AI trading...', 'info');
+        await api.aiTraderReset(1000000);
+        log('AI trading reset to $1,000,000', 'success');
+        await loadAiTrader();
+    } catch (error) {
+        log(`Error resetting: ${error}`, 'error');
+    }
+}
+
+async function aiEvaluatePredictions(): Promise<void> {
+    try {
+        log('Evaluating pending predictions...', 'info');
+        const count = await api.aiTraderEvaluatePredictions();
+        log(`Evaluated ${count} predictions`, 'success');
+        await loadAiTrader();
+    } catch (error) {
+        log(`Error evaluating predictions: ${error}`, 'error');
+    }
 }
 
 // Event listeners
@@ -1903,6 +2279,13 @@ function setupEventListeners(): void {
     });
     // Load saved API key on startup
     loadClaudeApiKey();
+
+    // AI Trader
+    document.getElementById('ai-start-session-btn')?.addEventListener('click', aiStartSession);
+    document.getElementById('ai-end-session-btn')?.addEventListener('click', aiEndSession);
+    document.getElementById('ai-run-cycle-btn')?.addEventListener('click', aiRunCycle);
+    document.getElementById('ai-reset-btn')?.addEventListener('click', aiReset);
+    document.getElementById('ai-evaluate-btn')?.addEventListener('click', aiEvaluatePredictions);
 }
 
 // Initialize

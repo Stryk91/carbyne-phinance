@@ -714,3 +714,264 @@ button:disabled {
     outline: none;
     border-color: var(--primary);
 }
+
+/* ============================================================================
+   AI TRADER STYLES
+   ============================================================================ */
+
+.ai-trader-container {
+    padding: 16px;
+}
+
+.ai-status-panel {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.ai-status-row {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.ai-stat-box {
+    flex: 1;
+    min-width: 150px;
+    background: var(--bg-primary);
+    padding: 12px 16px;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ai-stat-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.ai-stat-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.ai-stat-change {
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.ai-stat-change.positive {
+    color: var(--success);
+}
+
+.ai-stat-change.negative {
+    color: var(--error);
+}
+
+.ai-controls {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.ai-section {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.ai-section h4 {
+    margin: 0 0 12px 0;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+}
+
+/* Forecast Grid */
+.ai-forecast-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px;
+}
+
+.ai-forecast-item {
+    background: var(--bg-primary);
+    padding: 10px 12px;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ai-forecast-item .label {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+}
+
+.ai-forecast-item .value {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Accuracy Panel */
+.ai-accuracy-panel {
+    text-align: center;
+}
+
+.ai-accuracy-main {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+
+.ai-accuracy-main .accuracy-value {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--primary);
+}
+
+.ai-accuracy-main .accuracy-label {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.ai-accuracy-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+/* Decision Log */
+.ai-decision-log {
+    max-height: 400px;
+    overflow-y: auto;
+    background: var(--bg-primary);
+    border-radius: 6px;
+    padding: 12px;
+}
+
+.ai-decision-item {
+    padding: 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+}
+
+.ai-decision-item:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+}
+
+.ai-decision-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.ai-decision-action {
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.ai-decision-action.buy {
+    background: rgba(16, 185, 129, 0.2);
+    color: var(--success);
+}
+
+.ai-decision-action.sell {
+    background: rgba(239, 68, 68, 0.2);
+    color: var(--error);
+}
+
+.ai-decision-action.hold {
+    background: rgba(99, 102, 241, 0.2);
+    color: var(--primary);
+}
+
+.ai-decision-symbol {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.ai-decision-details {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.ai-decision-reasoning {
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    margin-top: 8px;
+    padding: 8px;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    line-height: 1.4;
+}
+
+.ai-decision-prediction {
+    font-size: 0.8rem;
+    color: var(--primary);
+    margin-top: 8px;
+}
+
+.ai-decision-confidence {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.ai-decision-timestamp {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+/* Session Stats */
+.ai-stats-row {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.ai-mini-stat {
+    flex: 1;
+    min-width: 100px;
+    text-align: center;
+    background: var(--bg-primary);
+    padding: 12px;
+    border-radius: 6px;
+}
+
+.ai-mini-stat .label {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.ai-mini-stat .value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+/* Bankrupt State */
+.ai-trader-container.bankrupt .ai-stat-box:first-child {
+    border: 2px solid var(--error);
+}
+
+.ai-trader-container.bankrupt .ai-stat-value {
+    color: var(--error);
+}

@@ -88,6 +88,7 @@
                         <button class="tab" data-tab="portfolio">Portfolio</button>
                         <button class="tab" data-tab="macro">Macro Data</button>
                         <button class="tab" data-tab="ai-search">AI Search</button>
+                        <button class="tab" data-tab="ai-trader">AI Trader</button>
                         <button class="tab" data-tab="log">Log</button>
                     </div>
 
@@ -458,6 +459,132 @@
                                             <textarea id="pattern-description" rows="2" placeholder="Strong breakout above resistance..."></textarea>
                                         </div>
                                         <button id="add-pattern-btn">Add Pattern</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- AI Trader Tab -->
+                    <div id="ai-trader-tab" class="tab-content" style="display: none;">
+                        <div class="ai-trader-container">
+                            <!-- Status Panel -->
+                            <div class="ai-status-panel">
+                                <div class="ai-status-row">
+                                    <div class="ai-stat-box">
+                                        <span class="ai-stat-label">Portfolio Value</span>
+                                        <span class="ai-stat-value" id="ai-portfolio-value">$1,000,000.00</span>
+                                        <span class="ai-stat-change" id="ai-portfolio-change">+0.00%</span>
+                                    </div>
+                                    <div class="ai-stat-box">
+                                        <span class="ai-stat-label">Cash</span>
+                                        <span class="ai-stat-value" id="ai-cash">$1,000,000.00</span>
+                                    </div>
+                                    <div class="ai-stat-box">
+                                        <span class="ai-stat-label">Positions</span>
+                                        <span class="ai-stat-value" id="ai-positions-value">$0.00</span>
+                                    </div>
+                                    <div class="ai-stat-box">
+                                        <span class="ai-stat-label">Session</span>
+                                        <span class="ai-stat-value" id="ai-session-status">Inactive</span>
+                                    </div>
+                                </div>
+                                <div class="ai-controls">
+                                    <button id="ai-start-session-btn" class="btn-primary">Start Session</button>
+                                    <button id="ai-end-session-btn" class="btn-secondary" disabled>End Session</button>
+                                    <button id="ai-run-cycle-btn" class="btn-primary" disabled>Run Cycle</button>
+                                    <button id="ai-reset-btn" class="btn-secondary">Reset to $1M</button>
+                                    <span id="ai-model-status" style="margin-left: 16px; color: var(--text-secondary);"></span>
+                                </div>
+                            </div>
+
+                            <!-- Performance Chart -->
+                            <div class="ai-section">
+                                <h4>Performance vs Benchmark (SPY)</h4>
+                                <div id="ai-performance-chart" style="height: 300px; background: var(--bg-primary); border-radius: 8px;"></div>
+                            </div>
+
+                            <!-- Two Column Layout -->
+                            <div class="two-column" style="margin-top: 16px;">
+                                <!-- Compounding Forecast -->
+                                <div class="ai-section">
+                                    <h4>Compounding Forecast</h4>
+                                    <div class="ai-forecast-grid" id="ai-forecast">
+                                        <div class="ai-forecast-item">
+                                            <span class="label">Daily Return</span>
+                                            <span class="value" id="ai-daily-return">0.00%</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">Win Rate</span>
+                                            <span class="value" id="ai-win-rate">0%</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">Alpha</span>
+                                            <span class="value" id="ai-alpha">0.00%</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">30 Day Projection</span>
+                                            <span class="value" id="ai-proj-30d">$1,000,000</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">90 Day Projection</span>
+                                            <span class="value" id="ai-proj-90d">$1,000,000</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">1 Year Projection</span>
+                                            <span class="value" id="ai-proj-1y">$1,000,000</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">Time to Double</span>
+                                            <span class="value" id="ai-time-to-double">N/A</span>
+                                        </div>
+                                        <div class="ai-forecast-item">
+                                            <span class="label">Bankruptcy Risk</span>
+                                            <span class="value" id="ai-bankruptcy-risk">N/A</span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Prediction Accuracy -->
+                                <div class="ai-section">
+                                    <h4>Prediction Accuracy</h4>
+                                    <div class="ai-accuracy-panel" id="ai-accuracy">
+                                        <div class="ai-accuracy-main">
+                                            <span class="accuracy-value" id="ai-accuracy-pct">0%</span>
+                                            <span class="accuracy-label">Overall Accuracy</span>
+                                        </div>
+                                        <div class="ai-accuracy-stats">
+                                            <span id="ai-predictions-count">0 predictions evaluated</span>
+                                            <span id="ai-correct-count">0 correct</span>
+                                        </div>
+                                        <button id="ai-evaluate-btn" class="btn-secondary" style="margin-top: 8px;">Evaluate Pending</button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Decision Log -->
+                            <div class="ai-section" style="margin-top: 16px;">
+                                <h4>Decision Log</h4>
+                                <div class="ai-decision-log" id="ai-decision-log">
+                                    <div class="empty-state">No decisions yet. Start a session and run a cycle.</div>
+                                </div>
+                            </div>
+
+                            <!-- Session History -->
+                            <div class="ai-section" style="margin-top: 16px;">
+                                <h4>Session Stats</h4>
+                                <div class="ai-stats-row" id="ai-session-stats">
+                                    <div class="ai-mini-stat">
+                                        <span class="label">Sessions</span>
+                                        <span class="value" id="ai-sessions-count">0</span>
+                                    </div>
+                                    <div class="ai-mini-stat">
+                                        <span class="label">Total Decisions</span>
+                                        <span class="value" id="ai-decisions-count">0</span>
+                                    </div>
+                                    <div class="ai-mini-stat">
+                                        <span class="label">Total Trades</span>
+                                        <span class="value" id="ai-trades-count">0</span>
                                     </div>
                                 </div>
                             </div>

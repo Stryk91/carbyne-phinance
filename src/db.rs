@@ -10,8 +10,23 @@ use crate::models::{
     IndicatorAlertCondition, IndicatorAlertType, MacroData, PerformanceMetrics, Position,
     PositionType, PriceAlert, Signal, SignalDirection, SignalType, Strategy,
     StrategyConditionType, Symbol, TechnicalIndicator, TradeDirection,
+    PaperWallet, PaperPosition, PaperTrade, PaperTradeAction,
+    // AI Trading types
+    AiTraderConfig, AiTradingSession, AiTradeDecision, AiPerformanceSnapshot, AiPredictionAccuracy,
 };
 use crate::trends::TrendData;
+
+/// Extension trait for pipe-style method chaining
+trait Pipe: Sized {
+    fn pipe<F, R>(self, f: F) -> R
+    where
+        F: FnOnce(Self) -> R,
+    {
+        f(self)
+    }
+}
+
+impl<T> Pipe for Vec<T> {}
 
 /// Database wrapper for financial data storage
 pub struct Database {
@@ -60,6 +75,55 @@ impl Database {
                 [],
             )?;
             println!("[MIGRATION] Added favorited column to symbols table");
+        }
+
+        // Migrate ai_trader_config table with new guardrails columns
+        let ai_config_columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(ai_trader_config)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        // Add trading_mode column
+        if !ai_config_columns.contains(&"trading_mode".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE ai_trader_config ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'normal'",
+                [],
+            )?;
+            println!("[MIGRATION] Added trading_mode column to ai_trader_config");
+        }
+
+        // Add circuit breaker columns
+        if !ai_config_columns.contains(&"daily_loss_threshold".to_string()) {
+            self.conn.execute_batch(r#"
+                ALTER TABLE ai_trader_config ADD COLUMN daily_loss_threshold REAL NOT NULL DEFAULT -10.0;
+                ALTER TABLE ai_trader_config ADD COLUMN consecutive_loss_limit INTEGER NOT NULL DEFAULT 5;
+                ALTER TABLE ai_trader_config ADD COLUMN auto_conservative_on_trigger INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE ai_trader_config ADD COLUMN circuit_breaker_triggered INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE ai_trader_config ADD COLUMN circuit_breaker_until TIMESTAMP;
+            "#)?;
+            println!("[MIGRATION] Added circuit breaker columns to ai_trader_config");
+        }
+
+        // Add override columns
+        if !ai_config_columns.contains(&"override_enabled".to_string()) {
+            self.conn.execute_batch(r#"
+                ALTER TABLE ai_trader_config ADD COLUMN override_enabled INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE ai_trader_config ADD COLUMN override_expires_at TIMESTAMP;
+                ALTER TABLE ai_trader_config ADD COLUMN override_max_position_pct REAL;
+            "#)?;
+            println!("[MIGRATION] Added override columns to ai_trader_config");
+        }
+
+        // Add guardrail columns
+        if !ai_config_columns.contains(&"max_daily_trades".to_string()) {
+            self.conn.execute_batch(r#"
+                ALTER TABLE ai_trader_config ADD COLUMN max_daily_trades INTEGER NOT NULL DEFAULT 10;
+                ALTER TABLE ai_trader_config ADD COLUMN max_single_trade_value REAL NOT NULL DEFAULT 50000.0;
+                ALTER TABLE ai_trader_config ADD COLUMN require_confluence INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE ai_trader_config ADD COLUMN blocked_hours TEXT DEFAULT '09:30-09:45,15:45-16:00';
+            "#)?;
+            println!("[MIGRATION] Added guardrail columns to ai_trader_config");
         }
 
         Ok(())
@@ -1693,6 +1757,931 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    // ========================================================================
+    // Paper Trading Methods
+    // ========================================================================
+
+    /// Get paper wallet balance
+    pub fn get_paper_wallet(&self) -> Result<PaperWallet> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, cash, created_at, updated_at FROM paper_wallet WHERE id = 1",
+        )?;
+
+        let wallet = stmt.query_row([], |row| {
+            Ok(PaperWallet {
+                id: row.get(0)?,
+                cash: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+
+        Ok(wallet)
+    }
+
+    /// Update paper wallet cash balance
+    fn update_paper_cash(&self, new_cash: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE paper_wallet SET cash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            params![new_cash],
+        )?;
+        Ok(())
+    }
+
+    /// Get all paper positions
+    pub fn get_paper_positions(&self) -> Result<Vec<PaperPosition>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, symbol, quantity, entry_price, entry_date, linked_event_id
+            FROM paper_positions
+            ORDER BY entry_date DESC
+            "#,
+        )?;
+
+        let positions = stmt
+            .query_map([], |row| {
+                Ok(PaperPosition {
+                    id: row.get(0)?,
+                    symbol: row.get(1)?,
+                    quantity: row.get(2)?,
+                    entry_price: row.get(3)?,
+                    entry_date: row.get(4)?,
+                    linked_event_id: row.get(5)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(positions)
+    }
+
+    /// Get paper position for a specific symbol
+    pub fn get_paper_position(&self, symbol: &str) -> Result<Option<PaperPosition>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, symbol, quantity, entry_price, entry_date, linked_event_id
+            FROM paper_positions
+            WHERE symbol = ?1
+            "#,
+        )?;
+
+        let result = stmt.query_row(params![symbol], |row| {
+            Ok(PaperPosition {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                quantity: row.get(2)?,
+                entry_price: row.get(3)?,
+                entry_date: row.get(4)?,
+                linked_event_id: row.get(5)?,
+            })
+        });
+
+        match result {
+            Ok(pos) => Ok(Some(pos)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Execute a paper trade (BUY or SELL)
+    /// Returns the trade record on success
+    pub fn execute_paper_trade(
+        &self,
+        symbol: &str,
+        action: PaperTradeAction,
+        quantity: f64,
+        price: f64,
+        linked_event_id: Option<i64>,
+        notes: Option<&str>,
+    ) -> Result<PaperTrade> {
+        let wallet = self.get_paper_wallet()?;
+        let cost = quantity * price;
+
+        match action {
+            PaperTradeAction::Buy => {
+                // Validate sufficient cash
+                if wallet.cash < cost {
+                    return Err(crate::error::PipelineError::ApiError(format!(
+                        "Insufficient cash: have ${:.2}, need ${:.2}",
+                        wallet.cash, cost
+                    )));
+                }
+
+                // Deduct cash
+                self.update_paper_cash(wallet.cash - cost)?;
+
+                // Add or update position
+                let existing = self.get_paper_position(symbol)?;
+                if let Some(pos) = existing {
+                    // Average down: new avg price = (old_qty * old_price + new_qty * new_price) / total_qty
+                    let total_qty = pos.quantity + quantity;
+                    let avg_price =
+                        (pos.quantity * pos.entry_price + quantity * price) / total_qty;
+                    self.conn.execute(
+                        "UPDATE paper_positions SET quantity = ?1, entry_price = ?2 WHERE id = ?3",
+                        params![total_qty, avg_price, pos.id],
+                    )?;
+                } else {
+                    // New position
+                    self.conn.execute(
+                        r#"
+                        INSERT INTO paper_positions (symbol, quantity, entry_price, linked_event_id)
+                        VALUES (?1, ?2, ?3, ?4)
+                        "#,
+                        params![symbol, quantity, price, linked_event_id],
+                    )?;
+                }
+
+                // Record trade
+                self.conn.execute(
+                    r#"
+                    INSERT INTO paper_trades (symbol, action, quantity, price, linked_event_id, notes)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "#,
+                    params![symbol, "BUY", quantity, price, linked_event_id, notes],
+                )?;
+            }
+            PaperTradeAction::Sell => {
+                // Validate sufficient shares
+                let position = self.get_paper_position(symbol)?;
+                let pos = position.ok_or_else(|| {
+                    crate::error::PipelineError::ApiError(format!(
+                        "No position in {} to sell",
+                        symbol
+                    ))
+                })?;
+
+                if pos.quantity < quantity {
+                    return Err(crate::error::PipelineError::ApiError(format!(
+                        "Insufficient shares: have {}, trying to sell {}",
+                        pos.quantity, quantity
+                    )));
+                }
+
+                // Calculate P&L
+                let pnl = (price - pos.entry_price) * quantity;
+
+                // Add proceeds to cash
+                self.update_paper_cash(wallet.cash + cost)?;
+
+                // Update or delete position
+                let remaining = pos.quantity - quantity;
+                if remaining <= 0.0001 {
+                    // Close position (using small epsilon for float comparison)
+                    self.conn.execute(
+                        "DELETE FROM paper_positions WHERE id = ?1",
+                        params![pos.id],
+                    )?;
+                } else {
+                    // Reduce position
+                    self.conn.execute(
+                        "UPDATE paper_positions SET quantity = ?1 WHERE id = ?2",
+                        params![remaining, pos.id],
+                    )?;
+                }
+
+                // Record trade with P&L
+                self.conn.execute(
+                    r#"
+                    INSERT INTO paper_trades (symbol, action, quantity, price, pnl, linked_event_id, notes)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![symbol, "SELL", quantity, price, pnl, linked_event_id, notes],
+                )?;
+            }
+        }
+
+        // Return the trade we just recorded
+        let trade_id = self.conn.last_insert_rowid();
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, symbol, action, quantity, price, pnl, timestamp, linked_event_id, notes
+            FROM paper_trades WHERE id = ?1
+            "#,
+        )?;
+
+        let trade = stmt.query_row(params![trade_id], |row| {
+            let action_str: String = row.get(2)?;
+            Ok(PaperTrade {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                action: PaperTradeAction::from_str(&action_str),
+                quantity: row.get(3)?,
+                price: row.get(4)?,
+                pnl: row.get(5)?,
+                timestamp: row.get(6)?,
+                linked_event_id: row.get(7)?,
+                notes: row.get(8)?,
+            })
+        })?;
+
+        Ok(trade)
+    }
+
+    /// Get paper trade history
+    pub fn get_paper_trades(&self, symbol: Option<&str>, limit: usize) -> Result<Vec<PaperTrade>> {
+        let sql = match symbol {
+            Some(_) => r#"
+                SELECT id, symbol, action, quantity, price, pnl, timestamp, linked_event_id, notes
+                FROM paper_trades
+                WHERE symbol = ?1
+                ORDER BY timestamp DESC
+                LIMIT ?2
+            "#,
+            None => r#"
+                SELECT id, symbol, action, quantity, price, pnl, timestamp, linked_event_id, notes
+                FROM paper_trades
+                ORDER BY timestamp DESC
+                LIMIT ?1
+            "#,
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+
+        let trades: Vec<PaperTrade> = match symbol {
+            Some(sym) => {
+                stmt.query_map(params![sym, limit as i64], |row| {
+                    let action_str: String = row.get(2)?;
+                    Ok(PaperTrade {
+                        id: row.get(0)?,
+                        symbol: row.get(1)?,
+                        action: PaperTradeAction::from_str(&action_str),
+                        quantity: row.get(3)?,
+                        price: row.get(4)?,
+                        pnl: row.get(5)?,
+                        timestamp: row.get(6)?,
+                        linked_event_id: row.get(7)?,
+                        notes: row.get(8)?,
+                    })
+                })?
+                .collect::<SqliteResult<Vec<_>>>()?
+            }
+            None => {
+                stmt.query_map(params![limit as i64], |row| {
+                    let action_str: String = row.get(2)?;
+                    Ok(PaperTrade {
+                        id: row.get(0)?,
+                        symbol: row.get(1)?,
+                        action: PaperTradeAction::from_str(&action_str),
+                        quantity: row.get(3)?,
+                        price: row.get(4)?,
+                        pnl: row.get(5)?,
+                        timestamp: row.get(6)?,
+                        linked_event_id: row.get(7)?,
+                        notes: row.get(8)?,
+                    })
+                })?
+                .collect::<SqliteResult<Vec<_>>>()?
+            }
+        };
+
+        Ok(trades)
+    }
+
+    /// Reset paper trading account (clear all positions, trades, reset cash)
+    pub fn reset_paper_account(&self, starting_cash: f64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM paper_positions", [])?;
+        tx.execute("DELETE FROM paper_trades", [])?;
+        tx.execute(
+            "UPDATE paper_wallet SET cash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            params![starting_cash],
+        )?;
+        tx.commit()?;
+        println!("[OK] Paper trading account reset with ${:.2}", starting_cash);
+        Ok(())
+    }
+
+    /// Calculate total paper portfolio value (cash + positions at current prices)
+    /// Returns (cash, positions_value, total_equity)
+    pub fn get_paper_portfolio_value(&self) -> Result<(f64, f64, f64)> {
+        let wallet = self.get_paper_wallet()?;
+        let positions = self.get_paper_positions()?;
+
+        let mut positions_value = 0.0;
+        for pos in positions {
+            // Try to get current price, fall back to entry price
+            let current_price = self
+                .get_latest_price(&pos.symbol)?
+                .unwrap_or(pos.entry_price);
+            positions_value += pos.quantity * current_price;
+        }
+
+        let total_equity = wallet.cash + positions_value;
+        Ok((wallet.cash, positions_value, total_equity))
+    }
+
+    // ========================================================================
+    // AI Trading Simulator Methods
+    // ========================================================================
+
+    /// Get AI trader configuration
+    pub fn get_ai_trader_config(&self) -> Result<AiTraderConfig> {
+        let row = self.conn.query_row(
+            r#"SELECT starting_capital, max_position_size_percent, stop_loss_percent,
+                    take_profit_percent, session_duration_minutes, benchmark_symbol, model_priority,
+                    trading_mode, daily_loss_threshold, consecutive_loss_limit,
+                    auto_conservative_on_trigger, max_daily_trades, max_single_trade_value,
+                    require_confluence, blocked_hours
+             FROM ai_trader_config WHERE id = 1"#,
+            [],
+            |row| {
+                Ok(AiTraderConfig {
+                    starting_capital: row.get(0)?,
+                    max_position_size_percent: row.get(1)?,
+                    stop_loss_percent: row.get(2)?,
+                    take_profit_percent: row.get(3)?,
+                    session_duration_minutes: row.get(4)?,
+                    benchmark_symbol: row.get(5)?,
+                    model_priority: row.get::<_, String>(6)?
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect(),
+                    trading_mode: row.get(7)?,
+                    daily_loss_threshold: row.get(8)?,
+                    consecutive_loss_limit: row.get(9)?,
+                    auto_conservative_on_trigger: row.get::<_, i32>(10)? != 0,
+                    max_daily_trades: row.get(11)?,
+                    max_single_trade_value: row.get(12)?,
+                    require_confluence: row.get::<_, i32>(13)? != 0,
+                    blocked_hours: row.get(14)?,
+                })
+            },
+        )?;
+        Ok(row)
+    }
+
+    /// Update AI trader configuration
+    pub fn update_ai_trader_config(&self, config: &AiTraderConfig) -> Result<()> {
+        self.conn.execute(
+            r#"UPDATE ai_trader_config SET
+                starting_capital = ?1, max_position_size_percent = ?2,
+                stop_loss_percent = ?3, take_profit_percent = ?4,
+                session_duration_minutes = ?5, benchmark_symbol = ?6,
+                model_priority = ?7, trading_mode = ?8, daily_loss_threshold = ?9,
+                consecutive_loss_limit = ?10, auto_conservative_on_trigger = ?11,
+                max_daily_trades = ?12, max_single_trade_value = ?13,
+                require_confluence = ?14, blocked_hours = ?15,
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = 1"#,
+            params![
+                config.starting_capital,
+                config.max_position_size_percent,
+                config.stop_loss_percent,
+                config.take_profit_percent,
+                config.session_duration_minutes,
+                config.benchmark_symbol,
+                config.model_priority.join(","),
+                config.trading_mode,
+                config.daily_loss_threshold,
+                config.consecutive_loss_limit,
+                config.auto_conservative_on_trigger as i32,
+                config.max_daily_trades,
+                config.max_single_trade_value,
+                config.require_confluence as i32,
+                config.blocked_hours,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Start a new AI trading session
+    pub fn start_ai_session(&self, starting_value: f64) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO ai_trading_sessions (starting_portfolio_value, status) VALUES (?1, 'active')",
+            params![starting_value],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// End an AI trading session
+    pub fn end_ai_session(&self, session_id: i64, ending_value: f64, notes: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ai_trading_sessions SET
+                end_time = CURRENT_TIMESTAMP, ending_portfolio_value = ?1,
+                status = 'completed', session_notes = ?2
+             WHERE id = ?3",
+            params![ending_value, notes, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get active AI trading session
+    pub fn get_active_ai_session(&self) -> Result<Option<AiTradingSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, start_time, end_time, starting_portfolio_value, ending_portfolio_value,
+                    decisions_count, trades_count, session_notes, status
+             FROM ai_trading_sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1"
+        )?;
+
+        let result = stmt.query_row([], |row| {
+            Ok(AiTradingSession {
+                id: row.get(0)?,
+                start_time: row.get(1)?,
+                end_time: row.get(2)?,
+                starting_portfolio_value: row.get(3)?,
+                ending_portfolio_value: row.get(4)?,
+                decisions_count: row.get(5)?,
+                trades_count: row.get(6)?,
+                session_notes: row.get(7)?,
+                status: row.get(8)?,
+            })
+        });
+
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get AI trading session by ID
+    pub fn get_ai_session(&self, session_id: i64) -> Result<Option<AiTradingSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, start_time, end_time, starting_portfolio_value, ending_portfolio_value,
+                    decisions_count, trades_count, session_notes, status
+             FROM ai_trading_sessions WHERE id = ?1"
+        )?;
+
+        let result = stmt.query_row(params![session_id], |row| {
+            Ok(AiTradingSession {
+                id: row.get(0)?,
+                start_time: row.get(1)?,
+                end_time: row.get(2)?,
+                starting_portfolio_value: row.get(3)?,
+                ending_portfolio_value: row.get(4)?,
+                decisions_count: row.get(5)?,
+                trades_count: row.get(6)?,
+                session_notes: row.get(7)?,
+                status: row.get(8)?,
+            })
+        });
+
+        match result {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Record an AI trade decision
+    pub fn record_ai_decision(&self, decision: &AiTradeDecision) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO ai_trade_decisions
+                (session_id, action, symbol, quantity, price_at_decision, confidence, reasoning,
+                 model_used, predicted_direction, predicted_price_target, predicted_timeframe_days,
+                 paper_trade_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                decision.session_id,
+                decision.action,
+                decision.symbol,
+                decision.quantity,
+                decision.price_at_decision,
+                decision.confidence,
+                decision.reasoning,
+                decision.model_used,
+                decision.predicted_direction,
+                decision.predicted_price_target,
+                decision.predicted_timeframe_days,
+                decision.paper_trade_id,
+            ],
+        )?;
+
+        // Update session decision count
+        if let Some(sid) = decision.session_id {
+            self.conn.execute(
+                "UPDATE ai_trading_sessions SET decisions_count = decisions_count + 1 WHERE id = ?1",
+                params![sid],
+            )?;
+            if decision.paper_trade_id.is_some() {
+                self.conn.execute(
+                    "UPDATE ai_trading_sessions SET trades_count = trades_count + 1 WHERE id = ?1",
+                    params![sid],
+                )?;
+            }
+        }
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get AI decisions with optional filters
+    pub fn get_ai_decisions(
+        &self,
+        session_id: Option<i64>,
+        symbol: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AiTradeDecision>> {
+        let mut sql = String::from(
+            "SELECT id, session_id, timestamp, action, symbol, quantity, price_at_decision,
+                    confidence, reasoning, model_used, predicted_direction, predicted_price_target,
+                    predicted_timeframe_days, actual_outcome, actual_price_at_timeframe,
+                    prediction_accurate, paper_trade_id
+             FROM ai_trade_decisions WHERE 1=1"
+        );
+
+        if session_id.is_some() {
+            sql.push_str(" AND session_id = ?1");
+        }
+        if symbol.is_some() {
+            sql.push_str(if session_id.is_some() { " AND symbol = ?2" } else { " AND symbol = ?1" });
+        }
+        sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let decisions = match (session_id, symbol) {
+            (Some(sid), Some(sym)) => {
+                stmt.query_map(params![sid, sym, limit], Self::map_ai_decision)?
+            }
+            (Some(sid), None) => {
+                stmt.query_map(params![sid, limit], Self::map_ai_decision)?
+            }
+            (None, Some(sym)) => {
+                stmt.query_map(params![sym, limit], Self::map_ai_decision)?
+            }
+            (None, None) => {
+                stmt.query_map(params![limit], Self::map_ai_decision)?
+            }
+        };
+
+        decisions.filter_map(|r| r.ok()).collect::<Vec<_>>().pipe(Ok)
+    }
+
+    fn map_ai_decision(row: &rusqlite::Row) -> rusqlite::Result<AiTradeDecision> {
+        Ok(AiTradeDecision {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            action: row.get(3)?,
+            symbol: row.get(4)?,
+            quantity: row.get(5)?,
+            price_at_decision: row.get(6)?,
+            confidence: row.get(7)?,
+            reasoning: row.get(8)?,
+            model_used: row.get(9)?,
+            predicted_direction: row.get(10)?,
+            predicted_price_target: row.get(11)?,
+            predicted_timeframe_days: row.get(12)?,
+            actual_outcome: row.get(13)?,
+            actual_price_at_timeframe: row.get(14)?,
+            prediction_accurate: row.get(15)?,
+            paper_trade_id: row.get(16)?,
+        })
+    }
+
+    /// Record a performance snapshot
+    pub fn record_ai_performance_snapshot(&self, snapshot: &AiPerformanceSnapshot) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO ai_performance_snapshots
+                (portfolio_value, cash, positions_value, benchmark_value, benchmark_symbol,
+                 total_pnl, total_pnl_percent, benchmark_pnl_percent, prediction_accuracy,
+                 trades_to_date, winning_trades, losing_trades, win_rate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                snapshot.portfolio_value,
+                snapshot.cash,
+                snapshot.positions_value,
+                snapshot.benchmark_value,
+                snapshot.benchmark_symbol,
+                snapshot.total_pnl,
+                snapshot.total_pnl_percent,
+                snapshot.benchmark_pnl_percent,
+                snapshot.prediction_accuracy,
+                snapshot.trades_to_date,
+                snapshot.winning_trades,
+                snapshot.losing_trades,
+                snapshot.win_rate,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get performance snapshots for charting
+    pub fn get_ai_performance_snapshots(&self, days: u32) -> Result<Vec<AiPerformanceSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, portfolio_value, cash, positions_value, benchmark_value,
+                    benchmark_symbol, total_pnl, total_pnl_percent, benchmark_pnl_percent,
+                    prediction_accuracy, trades_to_date, winning_trades, losing_trades, win_rate
+             FROM ai_performance_snapshots
+             WHERE timestamp >= datetime('now', ?1)
+             ORDER BY timestamp ASC"
+        )?;
+
+        let days_param = format!("-{} days", days);
+        let snapshots = stmt.query_map(params![days_param], |row| {
+            Ok(AiPerformanceSnapshot {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                portfolio_value: row.get(2)?,
+                cash: row.get(3)?,
+                positions_value: row.get(4)?,
+                benchmark_value: row.get(5)?,
+                benchmark_symbol: row.get(6)?,
+                total_pnl: row.get(7)?,
+                total_pnl_percent: row.get(8)?,
+                benchmark_pnl_percent: row.get(9)?,
+                prediction_accuracy: row.get(10)?,
+                trades_to_date: row.get(11)?,
+                winning_trades: row.get(12)?,
+                losing_trades: row.get(13)?,
+                win_rate: row.get(14)?,
+            })
+        })?;
+
+        snapshots.filter_map(|r| r.ok()).collect::<Vec<_>>().pipe(Ok)
+    }
+
+    /// Get the first performance snapshot (for benchmark baseline)
+    pub fn get_first_ai_snapshot(&self) -> Result<Option<AiPerformanceSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, portfolio_value, cash, positions_value, benchmark_value,
+                    benchmark_symbol, total_pnl, total_pnl_percent, benchmark_pnl_percent,
+                    prediction_accuracy, trades_to_date, winning_trades, losing_trades, win_rate
+             FROM ai_performance_snapshots ORDER BY timestamp ASC LIMIT 1"
+        )?;
+
+        let result = stmt.query_row([], |row| {
+            Ok(AiPerformanceSnapshot {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                portfolio_value: row.get(2)?,
+                cash: row.get(3)?,
+                positions_value: row.get(4)?,
+                benchmark_value: row.get(5)?,
+                benchmark_symbol: row.get(6)?,
+                total_pnl: row.get(7)?,
+                total_pnl_percent: row.get(8)?,
+                benchmark_pnl_percent: row.get(9)?,
+                prediction_accuracy: row.get(10)?,
+                trades_to_date: row.get(11)?,
+                winning_trades: row.get(12)?,
+                losing_trades: row.get(13)?,
+                win_rate: row.get(14)?,
+            })
+        });
+
+        match result {
+            Ok(snap) => Ok(Some(snap)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Update prediction outcome after timeframe expires
+    pub fn update_ai_prediction_outcome(
+        &self,
+        decision_id: i64,
+        actual_outcome: &str,
+        actual_price: f64,
+        was_accurate: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ai_trade_decisions SET
+                actual_outcome = ?1, actual_price_at_timeframe = ?2, prediction_accurate = ?3
+             WHERE id = ?4",
+            params![actual_outcome, actual_price, was_accurate as i32, decision_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get unevaluated predictions that have reached their timeframe
+    pub fn get_unevaluated_ai_predictions(&self) -> Result<Vec<AiTradeDecision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, timestamp, action, symbol, quantity, price_at_decision,
+                    confidence, reasoning, model_used, predicted_direction, predicted_price_target,
+                    predicted_timeframe_days, actual_outcome, actual_price_at_timeframe,
+                    prediction_accurate, paper_trade_id
+             FROM ai_trade_decisions
+             WHERE prediction_accurate IS NULL
+               AND predicted_timeframe_days IS NOT NULL
+               AND datetime(timestamp, '+' || predicted_timeframe_days || ' days') <= datetime('now')"
+        )?;
+
+        let decisions = stmt.query_map([], Self::map_ai_decision)?;
+        decisions.filter_map(|r| r.ok()).collect::<Vec<_>>().pipe(Ok)
+    }
+
+    /// Calculate prediction accuracy statistics
+    pub fn get_ai_prediction_accuracy(&self) -> Result<AiPredictionAccuracy> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ai_trade_decisions WHERE prediction_accurate IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let accurate: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ai_trade_decisions WHERE prediction_accurate = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let accuracy_percent = if total > 0 {
+            (accurate as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(AiPredictionAccuracy {
+            total_predictions: total as u32,
+            accurate_predictions: accurate as u32,
+            accuracy_percent,
+        })
+    }
+
+    /// Get total sessions count
+    pub fn get_ai_sessions_count(&self) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ai_trading_sessions",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Get total AI decisions count
+    pub fn get_ai_decisions_count(&self) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ai_trade_decisions",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    /// Reset AI trading data (for fresh start)
+    pub fn reset_ai_trading(&self, starting_capital: f64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM ai_performance_snapshots", [])?;
+        tx.execute("DELETE FROM ai_trade_decisions", [])?;
+        tx.execute("DELETE FROM ai_trading_sessions", [])?;
+        tx.execute("DELETE FROM paper_positions", [])?;
+        tx.execute("DELETE FROM paper_trades", [])?;
+        tx.execute(
+            "UPDATE paper_wallet SET cash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            params![starting_capital],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Guardrails & Circuit Breaker Methods
+    // ========================================================================
+
+    /// Update trading mode in ai_trader_config
+    pub fn update_trading_mode(&self, mode: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ai_trader_config SET trading_mode = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            params![mode],
+        )?;
+        Ok(())
+    }
+
+    /// Get current trading mode from config
+    pub fn get_trading_mode(&self) -> Result<String> {
+        let mode: String = self.conn.query_row(
+            "SELECT trading_mode FROM ai_trader_config WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(mode)
+    }
+
+    /// Log circuit breaker event
+    pub fn log_circuit_breaker_event(
+        &self,
+        trigger_type: &str,
+        previous_mode: &str,
+        new_mode: &str,
+        daily_pnl: f64,
+        consecutive_losses: i32,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r#"INSERT INTO circuit_breaker_events
+               (trigger_type, previous_mode, new_mode, daily_pnl, consecutive_losses, resume_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', '+1 hour'))"#,
+            params![trigger_type, previous_mode, new_mode, daily_pnl, consecutive_losses],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Log trade rejection
+    pub fn log_trade_rejection(&self, rejection: &crate::ai_trader::TradeRejection) -> Result<i64> {
+        self.conn.execute(
+            r#"INSERT INTO trade_rejections
+               (session_id, attempted_action, symbol, quantity, quantity_percent,
+                estimated_value, reason, rule_triggered, trading_mode, raw_request)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                rejection.session_id,
+                rejection.attempted_action,
+                rejection.symbol,
+                rejection.quantity,
+                rejection.quantity_percent,
+                rejection.estimated_value,
+                rejection.reason,
+                rejection.rule_triggered,
+                rejection.trading_mode,
+                rejection.raw_request,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get paper trades from today only
+    pub fn get_paper_trades_today(&self) -> Result<Vec<PaperTrade>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, symbol, action, quantity, price, pnl, timestamp, linked_event_id, notes
+               FROM paper_trades
+               WHERE date(timestamp) = date('now')
+               ORDER BY timestamp DESC"#
+        )?;
+
+        let trades = stmt.query_map([], |row| {
+            Ok(PaperTrade {
+                id: row.get(0)?,
+                symbol: row.get(1)?,
+                action: PaperTradeAction::from_str(&row.get::<_, String>(2)?),
+                quantity: row.get(3)?,
+                price: row.get(4)?,
+                pnl: row.get(5)?,
+                timestamp: row.get(6)?,
+                linked_event_id: row.get(7)?,
+                notes: row.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(trades)
+    }
+
+    /// Get recent trade rejections
+    pub fn get_trade_rejections(&self, limit: usize) -> Result<Vec<(i64, String, String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, timestamp, attempted_action, symbol, reason, rule_triggered
+               FROM trade_rejections
+               ORDER BY timestamp DESC
+               LIMIT ?1"#
+        )?;
+
+        let rejections = stmt.query_map(params![limit], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rejections)
+    }
+
+    /// Get circuit breaker events
+    pub fn get_circuit_breaker_events(&self, limit: usize) -> Result<Vec<(i64, String, String, String, String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, timestamp, trigger_type, previous_mode, new_mode, daily_pnl
+               FROM circuit_breaker_events
+               ORDER BY timestamp DESC
+               LIMIT ?1"#
+        )?;
+
+        let events = stmt.query_map(params![limit], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(events)
+    }
+
+    /// Update circuit breaker settings in config
+    pub fn update_circuit_breaker_settings(
+        &self,
+        daily_loss_threshold: f64,
+        consecutive_loss_limit: i32,
+        auto_conservative: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"UPDATE ai_trader_config SET
+               daily_loss_threshold = ?1,
+               consecutive_loss_limit = ?2,
+               auto_conservative_on_trigger = ?3,
+               updated_at = CURRENT_TIMESTAMP
+               WHERE id = 1"#,
+            params![daily_loss_threshold, consecutive_loss_limit, auto_conservative as i32],
+        )?;
+        Ok(())
+    }
 }
 
 /// Database schema SQL
@@ -1960,4 +2949,178 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(backtest_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_trades_symbol ON backtest_trades(symbol);
+
+-- Paper trading wallet (singleton - one paper account)
+CREATE TABLE IF NOT EXISTS paper_wallet (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cash REAL NOT NULL DEFAULT 1000000.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Initialize wallet if not exists (default $1M for AI trading)
+INSERT OR IGNORE INTO paper_wallet (id, cash) VALUES (1, 1000000.0);
+
+-- Paper trading positions (open positions)
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    quantity REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    entry_date TEXT DEFAULT CURRENT_TIMESTAMP,
+    linked_event_id INTEGER,
+    FOREIGN KEY (linked_event_id) REFERENCES market_events(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_positions_symbol ON paper_positions(symbol);
+
+-- Paper trading history (all trades)
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('BUY', 'SELL')),
+    quantity REAL NOT NULL,
+    price REAL NOT NULL,
+    pnl REAL,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    linked_event_id INTEGER,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_trades_symbol ON paper_trades(symbol);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_timestamp ON paper_trades(timestamp);
+
+-- ============================================================================
+-- AI Trading Simulator Tables
+-- ============================================================================
+
+-- AI Trading Sessions
+CREATE TABLE IF NOT EXISTS ai_trading_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    end_time DATETIME,
+    starting_portfolio_value REAL NOT NULL,
+    ending_portfolio_value REAL,
+    decisions_count INTEGER DEFAULT 0,
+    trades_count INTEGER DEFAULT 0,
+    session_notes TEXT,
+    status TEXT DEFAULT 'active' CHECK(status IN ('active', 'completed', 'interrupted'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_status ON ai_trading_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_start ON ai_trading_sessions(start_time);
+
+-- AI Trade Decisions (detailed reasoning log)
+CREATE TABLE IF NOT EXISTS ai_trade_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER REFERENCES ai_trading_sessions(id),
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    action TEXT NOT NULL CHECK(action IN ('BUY', 'SELL', 'HOLD')),
+    symbol TEXT NOT NULL,
+    quantity REAL,
+    price_at_decision REAL,
+    confidence REAL NOT NULL,
+    reasoning TEXT NOT NULL,
+    model_used TEXT NOT NULL,
+    predicted_direction TEXT CHECK(predicted_direction IN ('bullish', 'bearish', 'neutral')),
+    predicted_price_target REAL,
+    predicted_timeframe_days INTEGER,
+    actual_outcome TEXT,
+    actual_price_at_timeframe REAL,
+    prediction_accurate INTEGER,
+    paper_trade_id INTEGER REFERENCES paper_trades(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_decisions_session ON ai_trade_decisions(session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_decisions_symbol ON ai_trade_decisions(symbol);
+CREATE INDEX IF NOT EXISTS idx_ai_decisions_timestamp ON ai_trade_decisions(timestamp);
+
+-- AI Performance Snapshots (for charting equity curve)
+CREATE TABLE IF NOT EXISTS ai_performance_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    portfolio_value REAL NOT NULL,
+    cash REAL NOT NULL,
+    positions_value REAL NOT NULL,
+    benchmark_value REAL NOT NULL,
+    benchmark_symbol TEXT DEFAULT 'SPY',
+    total_pnl REAL NOT NULL,
+    total_pnl_percent REAL NOT NULL,
+    benchmark_pnl_percent REAL NOT NULL,
+    prediction_accuracy REAL,
+    trades_to_date INTEGER NOT NULL,
+    winning_trades INTEGER NOT NULL,
+    losing_trades INTEGER NOT NULL,
+    win_rate REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_performance_timestamp ON ai_performance_snapshots(timestamp);
+
+-- AI Trader Configuration (singleton like paper_wallet)
+CREATE TABLE IF NOT EXISTS ai_trader_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    starting_capital REAL NOT NULL DEFAULT 1000000.0,
+    max_position_size_percent REAL NOT NULL DEFAULT 10.0,
+    stop_loss_percent REAL NOT NULL DEFAULT 5.0,
+    take_profit_percent REAL NOT NULL DEFAULT 15.0,
+    session_duration_minutes INTEGER NOT NULL DEFAULT 60,
+    benchmark_symbol TEXT NOT NULL DEFAULT 'SPY',
+    model_priority TEXT NOT NULL DEFAULT 'deepseek-v3.2:cloud,gpt-oss:120b-cloud,qwen3:235b',
+    -- Trading mode: 'aggressive', 'normal', 'conservative', 'paused'
+    trading_mode TEXT NOT NULL DEFAULT 'normal',
+    -- Circuit breaker settings
+    daily_loss_threshold REAL NOT NULL DEFAULT -10.0,
+    consecutive_loss_limit INTEGER NOT NULL DEFAULT 5,
+    auto_conservative_on_trigger INTEGER NOT NULL DEFAULT 1,
+    circuit_breaker_triggered INTEGER NOT NULL DEFAULT 0,
+    circuit_breaker_until TIMESTAMP,
+    -- STRYK override settings
+    override_enabled INTEGER NOT NULL DEFAULT 0,
+    override_expires_at TIMESTAMP,
+    override_max_position_pct REAL,
+    -- Guardrail settings
+    max_daily_trades INTEGER NOT NULL DEFAULT 10,
+    max_single_trade_value REAL NOT NULL DEFAULT 50000.0,
+    require_confluence INTEGER NOT NULL DEFAULT 1,
+    blocked_hours TEXT DEFAULT '09:30-09:45,15:45-16:00',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT OR IGNORE INTO ai_trader_config (id) VALUES (1);
+
+-- Trade rejections audit log
+CREATE TABLE IF NOT EXISTS trade_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    session_id INTEGER,
+    attempted_action TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    quantity REAL,
+    quantity_percent REAL,
+    estimated_value REAL,
+    reason TEXT NOT NULL,
+    rule_triggered TEXT NOT NULL,
+    trading_mode TEXT,
+    raw_request TEXT,
+    FOREIGN KEY (session_id) REFERENCES ai_trading_sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_rejections_timestamp ON trade_rejections(timestamp);
+CREATE INDEX IF NOT EXISTS idx_trade_rejections_rule ON trade_rejections(rule_triggered);
+
+-- Circuit breaker event log
+CREATE TABLE IF NOT EXISTS circuit_breaker_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    trigger_type TEXT NOT NULL,
+    previous_mode TEXT NOT NULL,
+    new_mode TEXT NOT NULL,
+    daily_pnl REAL,
+    consecutive_losses INTEGER,
+    resume_at TIMESTAMP,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_circuit_breaker_timestamp ON circuit_breaker_events(timestamp);
 "#;

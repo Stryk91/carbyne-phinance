@@ -92,3 +92,16 @@ qt-app/target
 tauri-app/dist/
 data/vectors.db
 tauri-app/src-tauri/tauri.conf.local.json
+
+# MCP node_modules
+mcp-cdp/node_modules/
+
+# Reports (generated)
+reports/
+
+# Backup files
+*.backup
+*.bak
+
+# Python venv
+.venv/

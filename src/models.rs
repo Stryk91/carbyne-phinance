@@ -450,6 +450,301 @@ pub struct BacktestResult {
     pub created_at: String,
 }
 
+// ============================================================================
+// Paper Trading Types
+// ============================================================================
+
+/// Paper trading wallet (tracks cash balance)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperWallet {
+    pub id: i64,
+    pub cash: f64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Paper trading position (open position)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperPosition {
+    pub id: i64,
+    pub symbol: String,
+    pub quantity: f64,
+    pub entry_price: f64,
+    pub entry_date: String,
+    pub linked_event_id: Option<i64>,
+}
+
+/// Paper trading action type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaperTradeAction {
+    Buy,
+    Sell,
+}
+
+impl PaperTradeAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PaperTradeAction::Buy => "BUY",
+            PaperTradeAction::Sell => "SELL",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "SELL" => PaperTradeAction::Sell,
+            _ => PaperTradeAction::Buy,
+        }
+    }
+}
+
+/// Paper trade history record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperTrade {
+    pub id: i64,
+    pub symbol: String,
+    pub action: PaperTradeAction,
+    pub quantity: f64,
+    pub price: f64,
+    pub pnl: Option<f64>,           // Calculated on SELL
+    pub timestamp: String,
+    pub linked_event_id: Option<i64>,
+    pub notes: Option<String>,
+}
+
+// ============================================================================
+// Confluence Signal Types
+// ============================================================================
+
+/// Individual indicator vote in a confluence signal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndicatorVote {
+    pub indicator_name: String,
+    pub direction: SignalDirection,
+    pub strength: f64,
+    pub value: f64,
+}
+
+/// Configuration for confluence signal detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluenceConfig {
+    pub min_agreeing_indicators: usize,
+    pub rsi_oversold: f64,
+    pub rsi_overbought: f64,
+    pub stoch_oversold: f64,
+    pub stoch_overbought: f64,
+    pub cci_oversold: f64,
+    pub cci_overbought: f64,
+    pub adx_strong_trend: f64,
+}
+
+impl Default for ConfluenceConfig {
+    fn default() -> Self {
+        Self {
+            min_agreeing_indicators: 3,
+            rsi_oversold: 30.0,
+            rsi_overbought: 70.0,
+            stoch_oversold: 20.0,
+            stoch_overbought: 80.0,
+            cci_oversold: -100.0,
+            cci_overbought: 100.0,
+            adx_strong_trend: 25.0,
+        }
+    }
+}
+
+/// A confluence signal that fires when 3+ indicators agree on direction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfluenceSignal {
+    pub id: i64,
+    pub symbol: String,
+    pub date: NaiveDate,
+    pub direction: SignalDirection,
+    pub strength: f64,
+    pub contributing_indicators: Vec<IndicatorVote>,
+    pub bullish_count: usize,
+    pub bearish_count: usize,
+    pub adx_confidence: Option<f64>,
+    pub price_at_signal: f64,
+    pub created_at: String,
+}
+
+// ============================================================================
+// AI Trading Simulator Types
+// ============================================================================
+
+/// AI Trader Configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTraderConfig {
+    pub starting_capital: f64,
+    pub max_position_size_percent: f64,
+    pub stop_loss_percent: f64,
+    pub take_profit_percent: f64,
+    pub session_duration_minutes: u32,
+    pub benchmark_symbol: String,
+    pub model_priority: Vec<String>,
+    // Trading mode: aggressive, normal, conservative, paused
+    pub trading_mode: String,
+    // Circuit breaker settings
+    pub daily_loss_threshold: f64,
+    pub consecutive_loss_limit: i32,
+    pub auto_conservative_on_trigger: bool,
+    // Guardrail settings
+    pub max_daily_trades: i32,
+    pub max_single_trade_value: f64,
+    pub require_confluence: bool,
+    pub blocked_hours: String,
+}
+
+impl Default for AiTraderConfig {
+    fn default() -> Self {
+        Self {
+            starting_capital: 1_000_000.0,
+            max_position_size_percent: 10.0,
+            stop_loss_percent: 5.0,
+            take_profit_percent: 15.0,
+            session_duration_minutes: 60,
+            benchmark_symbol: "SPY".to_string(),
+            model_priority: vec![
+                "deepseek-v3.2:cloud".to_string(),
+                "gpt-oss:120b-cloud".to_string(),
+                "qwen3:235b".to_string(),
+            ],
+            trading_mode: "normal".to_string(),
+            daily_loss_threshold: -10.0,
+            consecutive_loss_limit: 5,
+            auto_conservative_on_trigger: true,
+            max_daily_trades: 10,
+            max_single_trade_value: 50_000.0,
+            require_confluence: true,
+            blocked_hours: "09:30-09:45,15:45-16:00".to_string(),
+        }
+    }
+}
+
+/// AI Trading Session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTradingSession {
+    pub id: i64,
+    pub start_time: String,
+    pub end_time: Option<String>,
+    pub starting_portfolio_value: f64,
+    pub ending_portfolio_value: Option<f64>,
+    pub decisions_count: i32,
+    pub trades_count: i32,
+    pub session_notes: Option<String>,
+    pub status: String,
+}
+
+/// AI Trade Decision with reasoning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTradeDecision {
+    pub id: i64,
+    pub session_id: Option<i64>,
+    pub timestamp: String,
+    pub action: String,
+    pub symbol: String,
+    pub quantity: Option<f64>,
+    pub price_at_decision: Option<f64>,
+    pub confidence: f64,
+    pub reasoning: String,
+    pub model_used: String,
+    pub predicted_direction: Option<String>,
+    pub predicted_price_target: Option<f64>,
+    pub predicted_timeframe_days: Option<i32>,
+    pub actual_outcome: Option<String>,
+    pub actual_price_at_timeframe: Option<f64>,
+    pub prediction_accurate: Option<bool>,
+    pub paper_trade_id: Option<i64>,
+}
+
+/// AI Performance Snapshot for charting
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiPerformanceSnapshot {
+    pub id: i64,
+    pub timestamp: String,
+    pub portfolio_value: f64,
+    pub cash: f64,
+    pub positions_value: f64,
+    pub benchmark_value: f64,
+    pub benchmark_symbol: String,
+    pub total_pnl: f64,
+    pub total_pnl_percent: f64,
+    pub benchmark_pnl_percent: f64,
+    pub prediction_accuracy: Option<f64>,
+    pub trades_to_date: i32,
+    pub winning_trades: i32,
+    pub losing_trades: i32,
+    pub win_rate: Option<f64>,
+}
+
+/// AI Prediction Accuracy Statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiPredictionAccuracy {
+    pub total_predictions: u32,
+    pub accurate_predictions: u32,
+    pub accuracy_percent: f64,
+}
+
+/// AI Trader Status Response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiTraderStatus {
+    pub is_running: bool,
+    pub current_session: Option<AiTradingSession>,
+    pub portfolio_value: f64,
+    pub cash: f64,
+    pub positions_value: f64,
+    pub is_bankrupt: bool,
+    pub sessions_completed: u32,
+    pub total_decisions: u32,
+    pub total_trades: u32,
+}
+
+/// Benchmark Comparison Data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkComparison {
+    pub portfolio_return_percent: f64,
+    pub benchmark_return_percent: f64,
+    pub alpha: f64,
+    pub tracking_data: Vec<(String, f64, f64)>, // (timestamp, portfolio_value, benchmark_value)
+}
+
+impl Default for BenchmarkComparison {
+    fn default() -> Self {
+        Self {
+            portfolio_return_percent: 0.0,
+            benchmark_return_percent: 0.0,
+            alpha: 0.0,
+            tracking_data: Vec::new(),
+        }
+    }
+}
+
+/// Compounding Forecast
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompoundingForecast {
+    pub current_daily_return: f64,
+    pub current_win_rate: f64,
+    pub projected_30_days: f64,
+    pub projected_90_days: f64,
+    pub projected_365_days: f64,
+    pub time_to_double: Option<u32>,
+    pub time_to_bankruptcy: Option<u32>,
+}
+
+impl CompoundingForecast {
+    pub fn insufficient_data() -> Self {
+        Self {
+            current_daily_return: 0.0,
+            current_win_rate: 0.0,
+            projected_30_days: 0.0,
+            projected_90_days: 0.0,
+            projected_365_days: 0.0,
+            time_to_double: None,
+            time_to_bankruptcy: None,
+        }
+    }
+}
+
 /// Yahoo Finance chart response structures
 pub mod yahoo {
     use serde::Deserialize;

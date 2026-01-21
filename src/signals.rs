@@ -2,7 +2,10 @@
 //!
 //! Detects trading signals from technical indicators
 
-use crate::models::{DailyPrice, Signal, SignalDirection, SignalType, TechnicalIndicator};
+use crate::models::{
+    ConfluenceConfig, ConfluenceSignal, DailyPrice, IndicatorVote, Signal, SignalDirection,
+    SignalType, TechnicalIndicator,
+};
 use chrono::NaiveDate;
 use std::collections::HashMap;
 
@@ -45,6 +48,7 @@ impl Default for SignalConfig {
 /// Main signal generator
 pub struct SignalEngine {
     config: SignalConfig,
+    confluence_config: ConfluenceConfig,
 }
 
 impl Default for SignalEngine {
@@ -57,11 +61,20 @@ impl SignalEngine {
     pub fn new() -> Self {
         Self {
             config: SignalConfig::default(),
+            confluence_config: ConfluenceConfig::default(),
         }
     }
 
     pub fn with_config(config: SignalConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            confluence_config: ConfluenceConfig::default(),
+        }
+    }
+
+    pub fn with_confluence_config(mut self, confluence_config: ConfluenceConfig) -> Self {
+        self.confluence_config = confluence_config;
+        self
     }
 
     /// Build a map of indicators by date for O(1) lookups
@@ -656,5 +669,351 @@ impl SignalEngine {
         }
 
         None
+    }
+
+    // ========================================================================
+    // Confluence Signal Detection
+    // ========================================================================
+
+    /// Detect confluence signal when 3+ indicators agree on direction
+    /// Returns ConfluenceSignal if enough indicators agree, None otherwise
+    pub fn detect_confluence_signal(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+        price: f64,
+        indicators: &HashMap<String, f64>,
+    ) -> Option<ConfluenceSignal> {
+        let mut votes: Vec<IndicatorVote> = Vec::new();
+        let mut bullish_count = 0usize;
+        let mut bearish_count = 0usize;
+        let mut bullish_strength_sum = 0.0f64;
+        let mut bearish_strength_sum = 0.0f64;
+
+        // RSI vote
+        if let Some(&rsi) = indicators.get("RSI_14") {
+            if rsi < self.confluence_config.rsi_oversold {
+                let strength = ((self.confluence_config.rsi_oversold - rsi) / 30.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "RSI_14".to_string(),
+                    direction: SignalDirection::Bullish,
+                    strength,
+                    value: rsi,
+                });
+                bullish_count += 1;
+                bullish_strength_sum += strength;
+            } else if rsi > self.confluence_config.rsi_overbought {
+                let strength = ((rsi - self.confluence_config.rsi_overbought) / 30.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "RSI_14".to_string(),
+                    direction: SignalDirection::Bearish,
+                    strength,
+                    value: rsi,
+                });
+                bearish_count += 1;
+                bearish_strength_sum += strength;
+            }
+        }
+
+        // MACD vote (bullish if MACD > Signal, bearish if MACD < Signal)
+        if let (Some(&macd), Some(&signal)) = (
+            indicators.get("MACD_12_26"),
+            indicators.get("MACD_SIGNAL_9"),
+        ) {
+            let diff = macd - signal;
+            if diff > 0.0 {
+                let strength = (diff.abs() / price.max(1.0) * 100.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "MACD".to_string(),
+                    direction: SignalDirection::Bullish,
+                    strength,
+                    value: macd,
+                });
+                bullish_count += 1;
+                bullish_strength_sum += strength;
+            } else if diff < 0.0 {
+                let strength = (diff.abs() / price.max(1.0) * 100.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "MACD".to_string(),
+                    direction: SignalDirection::Bearish,
+                    strength,
+                    value: macd,
+                });
+                bearish_count += 1;
+                bearish_strength_sum += strength;
+            }
+        }
+
+        // Bollinger Bands vote (price vs bands)
+        if let (Some(&upper), Some(&lower)) = (
+            indicators.get("BB_UPPER_20"),
+            indicators.get("BB_LOWER_20"),
+        ) {
+            if price < lower {
+                let middle = (upper + lower) / 2.0;
+                let strength = ((lower - price) / (middle - lower).max(0.01)).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "BB_LOWER".to_string(),
+                    direction: SignalDirection::Bullish,
+                    strength,
+                    value: price,
+                });
+                bullish_count += 1;
+                bullish_strength_sum += strength;
+            } else if price > upper {
+                let middle = (upper + lower) / 2.0;
+                let strength = ((price - upper) / (upper - middle).max(0.01)).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "BB_UPPER".to_string(),
+                    direction: SignalDirection::Bearish,
+                    strength,
+                    value: price,
+                });
+                bearish_count += 1;
+                bearish_strength_sum += strength;
+            }
+        }
+
+        // Stochastic vote
+        if let Some(&stoch_k) = indicators.get("STOCH_K_14") {
+            if stoch_k < self.confluence_config.stoch_oversold {
+                let strength =
+                    ((self.confluence_config.stoch_oversold - stoch_k) / 20.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "STOCH_K".to_string(),
+                    direction: SignalDirection::Bullish,
+                    strength,
+                    value: stoch_k,
+                });
+                bullish_count += 1;
+                bullish_strength_sum += strength;
+            } else if stoch_k > self.confluence_config.stoch_overbought {
+                let strength =
+                    ((stoch_k - self.confluence_config.stoch_overbought) / 20.0).min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "STOCH_K".to_string(),
+                    direction: SignalDirection::Bearish,
+                    strength,
+                    value: stoch_k,
+                });
+                bearish_count += 1;
+                bearish_strength_sum += strength;
+            }
+        }
+
+        // CCI vote
+        if let Some(&cci) = indicators.get("CCI_20") {
+            if cci < self.confluence_config.cci_oversold {
+                let strength =
+                    ((self.confluence_config.cci_oversold - cci) / 100.0).abs().min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "CCI_20".to_string(),
+                    direction: SignalDirection::Bullish,
+                    strength,
+                    value: cci,
+                });
+                bullish_count += 1;
+                bullish_strength_sum += strength;
+            } else if cci > self.confluence_config.cci_overbought {
+                let strength =
+                    ((cci - self.confluence_config.cci_overbought) / 100.0).abs().min(1.0);
+                votes.push(IndicatorVote {
+                    indicator_name: "CCI_20".to_string(),
+                    direction: SignalDirection::Bearish,
+                    strength,
+                    value: cci,
+                });
+                bearish_count += 1;
+                bearish_strength_sum += strength;
+            }
+        }
+
+        // ADX - confidence multiplier (doesn't vote on direction)
+        let adx_confidence = indicators.get("ADX_14").copied().filter(|&adx| {
+            adx > self.confluence_config.adx_strong_trend
+        });
+
+        // Determine if we have confluence
+        let min_required = self.confluence_config.min_agreeing_indicators;
+
+        let (direction, base_strength) = if bullish_count >= min_required {
+            let avg_strength = bullish_strength_sum / bullish_count as f64;
+            (SignalDirection::Bullish, avg_strength)
+        } else if bearish_count >= min_required {
+            let avg_strength = bearish_strength_sum / bearish_count as f64;
+            (SignalDirection::Bearish, avg_strength)
+        } else {
+            return None; // Not enough agreement
+        };
+
+        // Apply ADX confidence multiplier (cap at 2x)
+        let final_strength = if let Some(adx) = adx_confidence {
+            (base_strength * (adx / 25.0).min(2.0)).min(1.0)
+        } else {
+            base_strength
+        };
+
+        Some(ConfluenceSignal {
+            id: 0,
+            symbol: symbol.to_string(),
+            date,
+            direction,
+            strength: final_strength,
+            contributing_indicators: votes,
+            bullish_count,
+            bearish_count,
+            adx_confidence,
+            price_at_signal: price,
+            created_at: String::new(),
+        })
+    }
+
+    /// Generate all signals including confluence signals for a symbol
+    pub fn generate_signals_with_confluence(
+        &self,
+        symbol: &str,
+        indicators: &[TechnicalIndicator],
+        prices: &[DailyPrice],
+    ) -> (Vec<Signal>, Vec<ConfluenceSignal>) {
+        let individual_signals = self.generate_signals(symbol, indicators, prices);
+        let indicator_map = self.build_indicator_map(indicators);
+
+        let mut confluence_signals = Vec::new();
+
+        // Build price map
+        let price_map: HashMap<NaiveDate, f64> = prices
+            .iter()
+            .map(|p| (p.date, p.close))
+            .collect();
+
+        // Check for confluence on each date
+        for (date, day_indicators) in &indicator_map {
+            let price = price_map.get(date).copied().unwrap_or(0.0);
+            if let Some(confluence) =
+                self.detect_confluence_signal(symbol, *date, price, day_indicators)
+            {
+                confluence_signals.push(confluence);
+            }
+        }
+
+        (individual_signals, confluence_signals)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn test_detect_confluence_bullish() {
+        let engine = SignalEngine::new();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+
+        // Mock indicators that should trigger bullish confluence (4 bullish signals)
+        let mut indicators = HashMap::new();
+        indicators.insert("RSI_14".to_string(), 25.0); // Below 30 = Bullish
+        indicators.insert("MACD_12_26".to_string(), 1.5); // MACD > Signal = Bullish
+        indicators.insert("MACD_SIGNAL_9".to_string(), 1.0);
+        indicators.insert("STOCH_K_14".to_string(), 15.0); // Below 20 = Bullish
+        indicators.insert("CCI_20".to_string(), -150.0); // Below -100 = Bullish
+        indicators.insert("BB_UPPER_20".to_string(), 110.0);
+        indicators.insert("BB_LOWER_20".to_string(), 90.0);
+        indicators.insert("ADX_14".to_string(), 30.0); // Strong trend
+
+        let price = 95.0; // Below BB_LOWER, adds 5th bullish vote
+
+        let result = engine.detect_confluence_signal("AAPL", date, price, &indicators);
+
+        assert!(result.is_some(), "Confluence should fire with 5 bullish indicators");
+        let confluence = result.unwrap();
+        assert_eq!(confluence.direction, SignalDirection::Bullish);
+        assert!(confluence.strength > 0.0, "Strength should be positive");
+        assert!(confluence.bullish_count >= 3, "Should have at least 3 bullish votes");
+        assert!(confluence.adx_confidence.is_some(), "ADX > 25 should provide confidence");
+        assert_eq!(confluence.symbol, "AAPL");
+    }
+
+    #[test]
+    fn test_detect_confluence_bearish() {
+        let engine = SignalEngine::new();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+
+        // Mock indicators that should trigger bearish confluence
+        let mut indicators = HashMap::new();
+        indicators.insert("RSI_14".to_string(), 80.0); // Above 70 = Bearish
+        indicators.insert("MACD_12_26".to_string(), 0.5); // MACD < Signal = Bearish
+        indicators.insert("MACD_SIGNAL_9".to_string(), 1.0);
+        indicators.insert("STOCH_K_14".to_string(), 85.0); // Above 80 = Bearish
+        indicators.insert("CCI_20".to_string(), 150.0); // Above 100 = Bearish
+        indicators.insert("BB_UPPER_20".to_string(), 100.0);
+        indicators.insert("BB_LOWER_20".to_string(), 80.0);
+
+        let price = 105.0; // Above BB_UPPER = Bearish
+
+        let result = engine.detect_confluence_signal("TSLA", date, price, &indicators);
+
+        assert!(result.is_some(), "Confluence should fire with bearish indicators");
+        let confluence = result.unwrap();
+        assert_eq!(confluence.direction, SignalDirection::Bearish);
+        assert!(confluence.bearish_count >= 3, "Should have at least 3 bearish votes");
+    }
+
+    #[test]
+    fn test_detect_confluence_insufficient_agreement() {
+        let engine = SignalEngine::new();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+
+        // Mixed signals - only 2 bullish, 1 bearish = no confluence
+        let mut indicators = HashMap::new();
+        indicators.insert("RSI_14".to_string(), 25.0); // Bullish
+        indicators.insert("MACD_12_26".to_string(), 0.5); // Bearish (MACD < Signal)
+        indicators.insert("MACD_SIGNAL_9".to_string(), 1.0);
+        indicators.insert("STOCH_K_14".to_string(), 15.0); // Bullish
+        indicators.insert("CCI_20".to_string(), 50.0); // Neutral (between -100 and 100)
+        indicators.insert("BB_UPPER_20".to_string(), 110.0);
+        indicators.insert("BB_LOWER_20".to_string(), 90.0);
+
+        let price = 100.0; // Neutral (within bands)
+
+        let result = engine.detect_confluence_signal("MSFT", date, price, &indicators);
+
+        assert!(result.is_none(), "Confluence should NOT fire with only 2 agreeing indicators");
+    }
+
+    #[test]
+    fn test_confluence_adx_multiplier() {
+        let engine = SignalEngine::new();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+
+        // Same bullish setup, test with and without strong ADX
+        let mut indicators_weak_adx = HashMap::new();
+        indicators_weak_adx.insert("RSI_14".to_string(), 25.0);
+        indicators_weak_adx.insert("MACD_12_26".to_string(), 1.5);
+        indicators_weak_adx.insert("MACD_SIGNAL_9".to_string(), 1.0);
+        indicators_weak_adx.insert("STOCH_K_14".to_string(), 15.0);
+        indicators_weak_adx.insert("CCI_20".to_string(), -150.0);
+        indicators_weak_adx.insert("ADX_14".to_string(), 15.0); // Weak trend
+
+        let mut indicators_strong_adx = indicators_weak_adx.clone();
+        indicators_strong_adx.insert("ADX_14".to_string(), 40.0); // Strong trend
+
+        let price = 100.0;
+
+        let result_weak = engine.detect_confluence_signal("TEST", date, price, &indicators_weak_adx);
+        let result_strong = engine.detect_confluence_signal("TEST", date, price, &indicators_strong_adx);
+
+        assert!(result_weak.is_some());
+        assert!(result_strong.is_some());
+
+        let weak = result_weak.unwrap();
+        let strong = result_strong.unwrap();
+
+        assert!(weak.adx_confidence.is_none(), "Weak ADX should not provide confidence");
+        assert!(strong.adx_confidence.is_some(), "Strong ADX should provide confidence");
+        assert!(
+            strong.strength >= weak.strength,
+            "Strong ADX should boost strength"
+        );
     }
 }

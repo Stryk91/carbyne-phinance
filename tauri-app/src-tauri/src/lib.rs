@@ -7,7 +7,11 @@ use financial_pipeline::{
     VectorStore, MarketEvent, PricePattern,
     ClaudeClient, FinancialContext, PriceContext as ClaudePriceContext,
     FinnhubClient, SimpleNewsItem, PriceReaction,
+    PaperWallet, PaperPosition, PaperTrade, PaperTradeAction,
+    AiTrader, AiTraderConfig, AiTradingSession, AiTradeDecision, AiPerformanceSnapshot,
+    AiPredictionAccuracy, AiTraderStatus, BenchmarkComparison, CompoundingForecast,
 };
+use financial_pipeline::ollama::{OllamaClient, SentimentResult, PatternExplanation};
 use chrono::Utc;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -1793,20 +1797,21 @@ struct EventWithPatternResponse {
     event_id: String,
     pattern_id: Option<String>,
     price_change_percent: Option<f64>,
+    pattern_error: Option<String>,  // Capture actual error reason
 }
 
 /// Add a market event with an auto-linked price pattern
-/// If api_key is provided and link_pattern is true, fetches price data around the event
-/// and creates a linked pattern showing the price reaction
+/// Uses local Yahoo price data for pattern linking (Finnhub free tier doesn't allow candle access)
 #[tauri::command]
 fn add_market_event_with_pattern(
+    state: State<AppState>,
     symbol: String,
     event_type: String,
     title: String,
     content: String,
     date: String,
     sentiment: Option<f32>,
-    api_key: Option<String>,
+    _api_key: Option<String>,  // Kept for API compatibility but not used
     link_pattern: bool,
     days_window: Option<i64>,
 ) -> Result<EventWithPatternResponse, String> {
@@ -1831,52 +1836,90 @@ fn add_market_event_with_pattern(
 
     store.add_market_event(&event).map_err(|e| e.to_string())?;
 
-    // If link_pattern is true and we have an API key, fetch price reaction
+    // If link_pattern is true, use local Yahoo price data to calculate reaction
     let mut pattern_id = None;
     let mut price_change = None;
+    let mut pattern_error: Option<String> = None;
 
     if link_pattern {
-        if let Some(key) = api_key {
-            if !key.is_empty() {
-                match FinnhubClient::new(key) {
-                    Ok(client) => {
-                        let window = days_window.unwrap_or(3);
-                        match client.fetch_price_reaction(&symbol, &date, window) {
-                            Ok(reaction) => {
-                                // Create linked pattern
-                                let pid = format!("news-reaction-{}", event_id);
-                                let pattern = PricePattern {
-                                    id: pid.clone(),
-                                    symbol: symbol.clone(),
-                                    pattern_type: "news_reaction".to_string(),
-                                    start_date: reaction.start_date,
-                                    end_date: reaction.end_date,
-                                    price_change_percent: reaction.price_change_percent as f32,
-                                    volume_change_percent: reaction.volume_change_percent as f32,
-                                    description: format!(
-                                        "Price reaction to: {} | Pre: ${:.2} → Post: ${:.2} ({:+.2}%)",
-                                        title,
-                                        reaction.pre_price,
-                                        reaction.post_price,
-                                        reaction.price_change_percent
-                                    ),
-                                };
+        let window = days_window.unwrap_or(3) as i32;
 
-                                if store.add_price_pattern(&pattern).is_ok() {
-                                    pattern_id = Some(pid);
-                                    price_change = Some(reaction.price_change_percent);
-                                }
-                            }
-                            Err(e) => {
-                                // Log but don't fail - event was still saved
-                                eprintln!("Warning: Could not fetch price reaction: {}", e);
+        // Get local price data from Yahoo (already fetched)
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let prices = db.get_prices(&symbol).map_err(|e| e.to_string())?;
+
+        if prices.is_empty() {
+            pattern_error = Some(format!("No local price data for {}", symbol));
+        } else {
+            // Parse event date
+            use chrono::NaiveDate;
+            if let Ok(event_date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                // Find prices around the event date
+                let mut pre_price: Option<f64> = None;
+                let mut post_price: Option<f64> = None;
+                let mut start_date_str = String::new();
+                let mut end_date_str = String::new();
+                let mut pre_volume: i64 = 0;
+                let mut post_volume: i64 = 0;
+
+                for price in &prices {
+                    if let Ok(price_date) = NaiveDate::parse_from_str(&price.date.to_string(), "%Y-%m-%d") {
+                        let days_diff = (price_date - event_date).num_days();
+
+                        // Find closest price BEFORE event (within window)
+                        if days_diff >= -(window as i64) && days_diff <= 0 {
+                            if pre_price.is_none() || days_diff > -(window as i64) {
+                                pre_price = Some(price.close);
+                                start_date_str = price.date.to_string();
+                                pre_volume = price.volume;
                             }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Invalid Finnhub API key: {}", e);
+
+                        // Find closest price AFTER event (within window)
+                        if days_diff >= 0 && days_diff <= window as i64 {
+                            post_price = Some(price.close);
+                            end_date_str = price.date.to_string();
+                            post_volume = price.volume;
+                        }
                     }
                 }
+
+                if let (Some(pre), Some(post)) = (pre_price, post_price) {
+                    let price_change_pct = ((post - pre) / pre) * 100.0;
+                    let volume_change_pct = if pre_volume > 0 {
+                        ((post_volume - pre_volume) as f64 / pre_volume as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    // Create linked pattern
+                    let pid = format!("news-reaction-{}", event_id);
+                    let pattern = PricePattern {
+                        id: pid.clone(),
+                        symbol: symbol.clone(),
+                        pattern_type: "news_reaction".to_string(),
+                        start_date: start_date_str.clone(),
+                        end_date: end_date_str.clone(),
+                        price_change_percent: price_change_pct as f32,
+                        volume_change_percent: volume_change_pct as f32,
+                        description: format!(
+                            "Price reaction to: {} | Pre: ${:.2} → Post: ${:.2} ({:+.2}%)",
+                            title,
+                            pre,
+                            post,
+                            price_change_pct
+                        ),
+                    };
+
+                    if store.add_price_pattern(&pattern).is_ok() {
+                        pattern_id = Some(pid);
+                        price_change = Some(price_change_pct);
+                    }
+                } else {
+                    pattern_error = Some(format!("No price data found around {} for {}", date, symbol));
+                }
+            } else {
+                pattern_error = Some(format!("Invalid date format: {}", date));
             }
         }
     }
@@ -1887,7 +1930,11 @@ fn add_market_event_with_pattern(
             price_change.unwrap_or(0.0)
         )
     } else if link_pattern {
-        "Event saved (pattern linking failed - check API key or date range)".to_string()
+        if let Some(ref err) = pattern_error {
+            format!("Event saved (pattern failed: {})", err)
+        } else {
+            "Event saved (pattern linking failed - unknown reason)".to_string()
+        }
     } else {
         "Market event added to vector database".to_string()
     };
@@ -1898,6 +1945,7 @@ fn add_market_event_with_pattern(
         event_id,
         pattern_id,
         price_change_percent: price_change,
+        pattern_error,
     })
 }
 
@@ -2033,6 +2081,39 @@ fn claude_query(
         output_tokens: result.output_tokens,
         conversation_id: result.conversation_id,
     })
+}
+
+// ============================================================================
+// Ollama LLM Commands (local AI via localhost:11434)
+// ============================================================================
+
+/// Check if Ollama is available (2-second timeout)
+#[tauri::command]
+async fn ollama_available() -> bool {
+    let client = OllamaClient::new();
+    client.is_available().await
+}
+
+/// Analyze sentiment of text using local Ollama
+#[tauri::command]
+async fn ollama_sentiment(text: String) -> Result<SentimentResult, String> {
+    let client = OllamaClient::new();
+    client.analyze_sentiment(&text).await.map_err(|e| e.to_string())
+}
+
+/// Explain a technical pattern using local Ollama
+#[tauri::command]
+async fn ollama_explain(pattern: String, context: Option<String>) -> Result<PatternExplanation, String> {
+    let client = OllamaClient::new();
+    let ctx = context.unwrap_or_default();
+    client.explain_pattern(&pattern, &ctx).await.map_err(|e| e.to_string())
+}
+
+/// Ask Ollama a question with financial context
+#[tauri::command]
+async fn ollama_ask(question: String, context: String) -> Result<String, String> {
+    let client = OllamaClient::new();
+    client.answer_query(&question, &context).await.map_err(|e| e.to_string())
 }
 
 /// Response for fetch_news command
@@ -2182,6 +2263,773 @@ fn fetch_candles(
     })
 }
 
+// ============================================================================
+// PAPER TRADING COMMANDS
+// ============================================================================
+
+/// Paper wallet balance response
+#[derive(Serialize)]
+struct PaperWalletResponse {
+    cash: f64,
+    positions_value: f64,
+    total_equity: f64,
+    starting_capital: f64,
+    total_pnl: f64,
+    total_pnl_percent: f64,
+}
+
+/// Paper position with current price and P&L
+#[derive(Serialize)]
+struct PaperPositionResponse {
+    id: i64,
+    symbol: String,
+    quantity: f64,
+    entry_price: f64,
+    entry_date: String,
+    current_price: f64,
+    current_value: f64,
+    cost_basis: f64,
+    unrealized_pnl: f64,
+    unrealized_pnl_percent: f64,
+}
+
+/// Paper trade response
+#[derive(Serialize)]
+struct PaperTradeResponse {
+    id: i64,
+    symbol: String,
+    action: String,
+    quantity: f64,
+    price: f64,
+    pnl: Option<f64>,
+    timestamp: String,
+    notes: Option<String>,
+}
+
+/// Get paper wallet balance and portfolio summary
+#[tauri::command]
+fn get_paper_balance(state: State<AppState>) -> Result<PaperWalletResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let (cash, positions_value, total_equity) = db
+        .get_paper_portfolio_value()
+        .map_err(|e| e.to_string())?;
+
+    let starting_capital = 100000.0; // Default starting capital
+    let total_pnl = total_equity - starting_capital;
+    let total_pnl_percent = if starting_capital > 0.0 {
+        (total_pnl / starting_capital) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(PaperWalletResponse {
+        cash,
+        positions_value,
+        total_equity,
+        starting_capital,
+        total_pnl,
+        total_pnl_percent,
+    })
+}
+
+/// Get all paper positions with current values
+#[tauri::command]
+fn get_paper_positions(state: State<AppState>) -> Result<Vec<PaperPositionResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let positions = db.get_paper_positions().map_err(|e| e.to_string())?;
+
+    let mut result = Vec::new();
+    for pos in positions {
+        let current_price = db
+            .get_latest_price(&pos.symbol)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(pos.entry_price);
+
+        let cost_basis = pos.quantity * pos.entry_price;
+        let current_value = pos.quantity * current_price;
+        let unrealized_pnl = current_value - cost_basis;
+        let unrealized_pnl_percent = if cost_basis > 0.0 {
+            (unrealized_pnl / cost_basis) * 100.0
+        } else {
+            0.0
+        };
+
+        result.push(PaperPositionResponse {
+            id: pos.id,
+            symbol: pos.symbol,
+            quantity: pos.quantity,
+            entry_price: pos.entry_price,
+            entry_date: pos.entry_date,
+            current_price,
+            current_value,
+            cost_basis,
+            unrealized_pnl,
+            unrealized_pnl_percent,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Execute a paper trade
+#[tauri::command]
+fn execute_paper_trade(
+    state: State<AppState>,
+    symbol: String,
+    action: String,
+    quantity: f64,
+    price: Option<f64>,
+    notes: Option<String>,
+) -> Result<PaperTradeResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+
+    // Get current price if not provided
+    let trade_price = match price {
+        Some(p) => p,
+        None => db
+            .get_latest_price(&symbol)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("No price data for {}. Fetch prices first or specify price.", symbol))?,
+    };
+
+    let trade_action = PaperTradeAction::from_str(&action);
+
+    let trade = db
+        .execute_paper_trade(
+            &symbol,
+            trade_action,
+            quantity,
+            trade_price,
+            None,
+            notes.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "[OK] Paper trade: {} {} {} @ ${:.2}",
+        trade.action.as_str(),
+        trade.quantity,
+        trade.symbol,
+        trade.price
+    );
+
+    Ok(PaperTradeResponse {
+        id: trade.id,
+        symbol: trade.symbol,
+        action: trade.action.as_str().to_string(),
+        quantity: trade.quantity,
+        price: trade.price,
+        pnl: trade.pnl,
+        timestamp: trade.timestamp,
+        notes: trade.notes,
+    })
+}
+
+/// Get paper trade history
+#[tauri::command]
+fn get_paper_trades(
+    state: State<AppState>,
+    symbol: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<PaperTradeResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let trades = db
+        .get_paper_trades(symbol.as_deref(), limit.unwrap_or(100))
+        .map_err(|e| e.to_string())?;
+
+    Ok(trades
+        .into_iter()
+        .map(|t| PaperTradeResponse {
+            id: t.id,
+            symbol: t.symbol,
+            action: t.action.as_str().to_string(),
+            quantity: t.quantity,
+            price: t.price,
+            pnl: t.pnl,
+            timestamp: t.timestamp,
+            notes: t.notes,
+        })
+        .collect())
+}
+
+/// Reset paper trading account
+#[tauri::command]
+fn reset_paper_account(
+    state: State<AppState>,
+    starting_cash: Option<f64>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let cash = starting_cash.unwrap_or(100000.0);
+    db.reset_paper_account(cash).map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Paper trading account reset with ${:.2}", cash),
+    })
+}
+
+// ============================================================================
+// AI TRADER COMMANDS
+// ============================================================================
+
+/// AI trading session response
+#[derive(Serialize)]
+struct AiSessionResponse {
+    id: i64,
+    start_time: String,
+    end_time: Option<String>,
+    starting_portfolio_value: f64,
+    ending_portfolio_value: Option<f64>,
+    decisions_count: i32,
+    trades_count: i32,
+    session_notes: Option<String>,
+    status: String,
+}
+
+impl From<AiTradingSession> for AiSessionResponse {
+    fn from(s: AiTradingSession) -> Self {
+        Self {
+            id: s.id,
+            start_time: s.start_time,
+            end_time: s.end_time,
+            starting_portfolio_value: s.starting_portfolio_value,
+            ending_portfolio_value: s.ending_portfolio_value,
+            decisions_count: s.decisions_count,
+            trades_count: s.trades_count,
+            session_notes: s.session_notes,
+            status: s.status,
+        }
+    }
+}
+
+/// AI trade decision response
+#[derive(Serialize)]
+struct AiDecisionResponse {
+    id: i64,
+    session_id: Option<i64>,
+    timestamp: String,
+    action: String,
+    symbol: String,
+    quantity: Option<f64>,
+    price_at_decision: Option<f64>,
+    confidence: f64,
+    reasoning: String,
+    model_used: String,
+    predicted_direction: Option<String>,
+    predicted_price_target: Option<f64>,
+    predicted_timeframe_days: Option<i32>,
+    actual_outcome: Option<String>,
+    actual_price_at_timeframe: Option<f64>,
+    prediction_accurate: Option<bool>,
+    paper_trade_id: Option<i64>,
+}
+
+impl From<AiTradeDecision> for AiDecisionResponse {
+    fn from(d: AiTradeDecision) -> Self {
+        Self {
+            id: d.id,
+            session_id: d.session_id,
+            timestamp: d.timestamp,
+            action: d.action,
+            symbol: d.symbol,
+            quantity: d.quantity,
+            price_at_decision: d.price_at_decision,
+            confidence: d.confidence,
+            reasoning: d.reasoning,
+            model_used: d.model_used,
+            predicted_direction: d.predicted_direction,
+            predicted_price_target: d.predicted_price_target,
+            predicted_timeframe_days: d.predicted_timeframe_days,
+            actual_outcome: d.actual_outcome,
+            actual_price_at_timeframe: d.actual_price_at_timeframe,
+            prediction_accurate: d.prediction_accurate,
+            paper_trade_id: d.paper_trade_id,
+        }
+    }
+}
+
+/// AI performance snapshot response
+#[derive(Serialize)]
+struct AiSnapshotResponse {
+    id: i64,
+    timestamp: String,
+    portfolio_value: f64,
+    cash: f64,
+    positions_value: f64,
+    benchmark_value: f64,
+    benchmark_symbol: String,
+    total_pnl: f64,
+    total_pnl_percent: f64,
+    benchmark_pnl_percent: f64,
+    prediction_accuracy: Option<f64>,
+    trades_to_date: i32,
+    winning_trades: i32,
+    losing_trades: i32,
+    win_rate: Option<f64>,
+}
+
+impl From<AiPerformanceSnapshot> for AiSnapshotResponse {
+    fn from(s: AiPerformanceSnapshot) -> Self {
+        Self {
+            id: s.id,
+            timestamp: s.timestamp,
+            portfolio_value: s.portfolio_value,
+            cash: s.cash,
+            positions_value: s.positions_value,
+            benchmark_value: s.benchmark_value,
+            benchmark_symbol: s.benchmark_symbol,
+            total_pnl: s.total_pnl,
+            total_pnl_percent: s.total_pnl_percent,
+            benchmark_pnl_percent: s.benchmark_pnl_percent,
+            prediction_accuracy: s.prediction_accuracy,
+            trades_to_date: s.trades_to_date,
+            winning_trades: s.winning_trades,
+            losing_trades: s.losing_trades,
+            win_rate: s.win_rate,
+        }
+    }
+}
+
+/// AI trader status response
+#[derive(Serialize)]
+struct AiStatusResponse {
+    is_running: bool,
+    current_session: Option<AiSessionResponse>,
+    portfolio_value: f64,
+    cash: f64,
+    positions_value: f64,
+    is_bankrupt: bool,
+    sessions_completed: u32,
+    total_decisions: u32,
+    total_trades: u32,
+}
+
+/// AI benchmark comparison response
+#[derive(Serialize)]
+struct AiBenchmarkResponse {
+    portfolio_return_percent: f64,
+    benchmark_return_percent: f64,
+    alpha: f64,
+    tracking_data: Vec<(String, f64, f64)>, // (timestamp, portfolio, benchmark)
+}
+
+/// AI compounding forecast response
+#[derive(Serialize)]
+struct AiForecastResponse {
+    current_daily_return: f64,
+    current_win_rate: f64,
+    projected_30_days: f64,
+    projected_90_days: f64,
+    projected_365_days: f64,
+    time_to_double: Option<u32>,
+    time_to_bankruptcy: Option<u32>,
+}
+
+/// AI prediction accuracy response
+#[derive(Serialize)]
+struct AiAccuracyResponse {
+    total_predictions: u32,
+    accurate_predictions: u32,
+    accuracy_percent: f64,
+}
+
+/// AI config response
+#[derive(Serialize)]
+struct AiConfigResponse {
+    starting_capital: f64,
+    max_position_size_percent: f64,
+    stop_loss_percent: f64,
+    take_profit_percent: f64,
+    session_duration_minutes: u32,
+    benchmark_symbol: String,
+    model_priority: Vec<String>,
+}
+
+/// Get AI trader status
+#[tauri::command]
+fn ai_trader_get_status(state: State<AppState>) -> Result<AiStatusResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let status = trader.get_status(&db).map_err(|e| e.to_string())?;
+
+    Ok(AiStatusResponse {
+        is_running: status.is_running,
+        current_session: status.current_session.map(|s| s.into()),
+        portfolio_value: status.portfolio_value,
+        cash: status.cash,
+        positions_value: status.positions_value,
+        is_bankrupt: status.is_bankrupt,
+        sessions_completed: status.sessions_completed,
+        total_decisions: status.total_decisions,
+        total_trades: status.total_trades,
+    })
+}
+
+/// Get AI trader configuration
+#[tauri::command]
+fn ai_trader_get_config(state: State<AppState>) -> Result<AiConfigResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+
+    Ok(AiConfigResponse {
+        starting_capital: config.starting_capital,
+        max_position_size_percent: config.max_position_size_percent,
+        stop_loss_percent: config.stop_loss_percent,
+        take_profit_percent: config.take_profit_percent,
+        session_duration_minutes: config.session_duration_minutes,
+        benchmark_symbol: config.benchmark_symbol,
+        model_priority: config.model_priority,
+    })
+}
+
+/// Start a new AI trading session
+#[tauri::command]
+fn ai_trader_start_session(state: State<AppState>) -> Result<AiSessionResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let session = trader.start_session(&db).map_err(|e| e.to_string())?;
+
+    println!("[AI Trader] Session {} started", session.id);
+
+    Ok(session.into())
+}
+
+/// End the current AI trading session
+#[tauri::command]
+fn ai_trader_end_session(
+    state: State<AppState>,
+    notes: Option<String>,
+) -> Result<Option<AiSessionResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let session = trader
+        .end_session(&db, notes.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    if let Some(ref s) = session {
+        println!("[AI Trader] Session {} ended", s.id);
+    }
+
+    Ok(session.map(|s| s.into()))
+}
+
+/// Run one AI trading cycle (gather context, query AI, execute trades)
+#[tauri::command]
+async fn ai_trader_run_cycle() -> Result<Vec<AiDecisionResponse>, String> {
+    // Open a separate database connection for async operations
+    // This is necessary because MutexGuard can't be held across await points
+    let db_path = get_data_path("finance.db");
+    let mut db = Database::open(&db_path).map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    // Check if Ollama is available
+    if !trader.check_ollama().await {
+        return Err("Ollama is not available. Start it with: ollama serve".to_string());
+    }
+
+    let decisions = trader.run_cycle(&mut db).await.map_err(|e| e.to_string())?;
+
+    println!("[AI Trader] Cycle completed with {} decisions", decisions.len());
+
+    Ok(decisions.into_iter().map(|d| d.into()).collect())
+}
+
+/// Get AI trading decisions
+#[tauri::command]
+fn ai_trader_get_decisions(
+    state: State<AppState>,
+    session_id: Option<i64>,
+    symbol: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<AiDecisionResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let decisions = db
+        .get_ai_decisions(session_id, symbol.as_deref(), limit.unwrap_or(100))
+        .map_err(|e| e.to_string())?;
+
+    Ok(decisions.into_iter().map(|d| d.into()).collect())
+}
+
+/// Get AI performance history (snapshots)
+#[tauri::command]
+fn ai_trader_get_performance_history(
+    state: State<AppState>,
+    days: Option<u32>,
+) -> Result<Vec<AiSnapshotResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let snapshots = db
+        .get_ai_performance_snapshots(days.unwrap_or(30))
+        .map_err(|e| e.to_string())?;
+
+    Ok(snapshots.into_iter().map(|s| s.into()).collect())
+}
+
+/// Get benchmark comparison (portfolio vs SPY)
+#[tauri::command]
+fn ai_trader_get_benchmark_comparison(state: State<AppState>) -> Result<AiBenchmarkResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let comparison = trader
+        .get_benchmark_comparison(&db)
+        .map_err(|e| e.to_string())?;
+
+    Ok(AiBenchmarkResponse {
+        portfolio_return_percent: comparison.portfolio_return_percent,
+        benchmark_return_percent: comparison.benchmark_return_percent,
+        alpha: comparison.alpha,
+        tracking_data: comparison.tracking_data,
+    })
+}
+
+/// Get compounding forecast
+#[tauri::command]
+fn ai_trader_get_compounding_forecast(state: State<AppState>) -> Result<AiForecastResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let forecast = trader
+        .get_compounding_forecast(&db)
+        .map_err(|e| e.to_string())?;
+
+    Ok(AiForecastResponse {
+        current_daily_return: forecast.current_daily_return,
+        current_win_rate: forecast.current_win_rate,
+        projected_30_days: forecast.projected_30_days,
+        projected_90_days: forecast.projected_90_days,
+        projected_365_days: forecast.projected_365_days,
+        time_to_double: forecast.time_to_double,
+        time_to_bankruptcy: forecast.time_to_bankruptcy,
+    })
+}
+
+/// Get AI prediction accuracy
+#[tauri::command]
+fn ai_trader_get_prediction_accuracy(state: State<AppState>) -> Result<AiAccuracyResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let accuracy = db.get_ai_prediction_accuracy().map_err(|e| e.to_string())?;
+
+    Ok(AiAccuracyResponse {
+        total_predictions: accuracy.total_predictions,
+        accurate_predictions: accuracy.accurate_predictions,
+        accuracy_percent: accuracy.accuracy_percent,
+    })
+}
+
+/// Evaluate pending AI predictions that have reached their timeframe
+#[tauri::command]
+fn ai_trader_evaluate_predictions(state: State<AppState>) -> Result<u32, String> {
+    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+    let trader = AiTrader::new(config);
+
+    let evaluated = trader
+        .evaluate_predictions(&mut db)
+        .map_err(|e| e.to_string())?;
+
+    if evaluated > 0 {
+        println!("[AI Trader] Evaluated {} predictions", evaluated);
+    }
+
+    Ok(evaluated)
+}
+
+/// Reset AI trading (clear all data and start fresh)
+#[tauri::command]
+fn ai_trader_reset(
+    state: State<AppState>,
+    starting_capital: Option<f64>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let capital = starting_capital.unwrap_or(1_000_000.0);
+    db.reset_ai_trading(capital).map_err(|e| e.to_string())?;
+
+    println!("[AI Trader] Reset with ${:.0} starting capital", capital);
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("AI trading reset with ${:.2} starting capital", capital),
+    })
+}
+
+// ============================================================================
+// Guardrails & Circuit Breaker Commands
+// ============================================================================
+
+/// Response for trading mode
+#[derive(Debug, Serialize)]
+struct TradingModeResponse {
+    mode: String,
+    max_position_pct: f64,
+    max_daily_trades: i32,
+    max_single_trade_value: f64,
+    require_confluence: bool,
+}
+
+/// Response for circuit breaker status
+#[derive(Debug, Serialize)]
+struct CircuitBreakerResponse {
+    daily_loss_threshold: f64,
+    consecutive_loss_limit: i32,
+    auto_conservative_on_trigger: bool,
+    // Current state (from runtime, not DB)
+    is_triggered: bool,
+}
+
+/// Response for trade rejection
+#[derive(Debug, Serialize)]
+struct TradeRejectionResponse {
+    id: i64,
+    timestamp: String,
+    action: String,
+    symbol: String,
+    reason: String,
+    rule_triggered: String,
+}
+
+/// Get current trading mode and guardrails
+#[tauri::command]
+fn ai_trader_get_mode(state: State<AppState>) -> Result<TradingModeResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+
+    Ok(TradingModeResponse {
+        mode: config.trading_mode,
+        max_position_pct: config.max_position_size_percent,
+        max_daily_trades: config.max_daily_trades,
+        max_single_trade_value: config.max_single_trade_value,
+        require_confluence: config.require_confluence,
+    })
+}
+
+/// Switch trading mode
+#[tauri::command]
+fn ai_trader_switch_mode(
+    state: State<AppState>,
+    mode: String,
+) -> Result<CommandResult, String> {
+    let valid_modes = ["aggressive", "normal", "conservative", "paused"];
+    if !valid_modes.contains(&mode.as_str()) {
+        return Err(format!("Invalid mode: {}. Must be one of: {:?}", mode, valid_modes));
+    }
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.update_trading_mode(&mode).map_err(|e| e.to_string())?;
+
+    println!("[AI Trader] Mode switched to: {}", mode);
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Trading mode switched to: {}", mode),
+    })
+}
+
+/// Get circuit breaker settings
+#[tauri::command]
+fn ai_trader_get_circuit_breaker(state: State<AppState>) -> Result<CircuitBreakerResponse, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let config = db.get_ai_trader_config().map_err(|e| e.to_string())?;
+
+    Ok(CircuitBreakerResponse {
+        daily_loss_threshold: config.daily_loss_threshold,
+        consecutive_loss_limit: config.consecutive_loss_limit,
+        auto_conservative_on_trigger: config.auto_conservative_on_trigger,
+        is_triggered: false, // Would need runtime state to know this
+    })
+}
+
+/// Update circuit breaker settings
+#[tauri::command]
+fn ai_trader_update_circuit_breaker(
+    state: State<AppState>,
+    daily_loss_threshold: f64,
+    consecutive_loss_limit: i32,
+    auto_conservative: bool,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    db.update_circuit_breaker_settings(daily_loss_threshold, consecutive_loss_limit, auto_conservative)
+        .map_err(|e| e.to_string())?;
+
+    println!("[AI Trader] Circuit breaker updated: threshold={:.1}%, consecutive_limit={}, auto_conservative={}",
+        daily_loss_threshold, consecutive_loss_limit, auto_conservative);
+
+    Ok(CommandResult {
+        success: true,
+        message: format!("Circuit breaker settings updated"),
+    })
+}
+
+/// Get recent trade rejections
+#[tauri::command]
+fn ai_trader_get_rejections(
+    state: State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<TradeRejectionResponse>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let rejections = db.get_trade_rejections(limit.unwrap_or(20))
+        .map_err(|e| e.to_string())?;
+
+    Ok(rejections.into_iter().map(|(id, timestamp, action, symbol, reason, rule)| {
+        TradeRejectionResponse {
+            id,
+            timestamp,
+            action,
+            symbol,
+            reason,
+            rule_triggered: rule,
+        }
+    }).collect())
+}
+
+/// Get circuit breaker event history
+#[tauri::command]
+fn ai_trader_get_circuit_breaker_events(
+    state: State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let events = db.get_circuit_breaker_events(limit.unwrap_or(10))
+        .map_err(|e| e.to_string())?;
+
+    Ok(events.into_iter().map(|(id, timestamp, trigger_type, prev_mode, new_mode, daily_pnl)| {
+        serde_json::json!({
+            "id": id,
+            "timestamp": timestamp,
+            "trigger_type": trigger_type,
+            "previous_mode": prev_mode,
+            "new_mode": new_mode,
+            "daily_pnl": daily_pnl,
+        })
+    }).collect())
+}
+
 /// Open a URL in a lightweight Tauri webview window
 /// Security: Only HTTPS allowed, JavaScript sandboxed, reuses single window to save RAM
 #[tauri::command]
@@ -2304,6 +3152,11 @@ pub fn run() {
             // Claude AI commands
             claude_chat,
             claude_query,
+            // Ollama local LLM commands
+            ollama_available,
+            ollama_sentiment,
+            ollama_explain,
+            ollama_ask,
             // Finnhub news commands
             fetch_news,
             fetch_price_reaction,
@@ -2312,6 +3165,32 @@ pub fn run() {
             add_market_event_with_pattern,
             // Article viewer
             open_article_window,
+            // Paper trading commands
+            get_paper_balance,
+            get_paper_positions,
+            execute_paper_trade,
+            get_paper_trades,
+            reset_paper_account,
+            // AI trader commands
+            ai_trader_get_status,
+            ai_trader_get_config,
+            ai_trader_start_session,
+            ai_trader_end_session,
+            ai_trader_run_cycle,
+            ai_trader_get_decisions,
+            ai_trader_get_performance_history,
+            ai_trader_get_benchmark_comparison,
+            ai_trader_get_compounding_forecast,
+            ai_trader_get_prediction_accuracy,
+            ai_trader_evaluate_predictions,
+            ai_trader_reset,
+            // Guardrails & circuit breaker commands
+            ai_trader_get_mode,
+            ai_trader_switch_mode,
+            ai_trader_get_circuit_breaker,
+            ai_trader_update_circuit_breaker,
+            ai_trader_get_rejections,
+            ai_trader_get_circuit_breaker_events,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {

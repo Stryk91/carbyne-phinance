@@ -1,4 +1,4 @@
-﻿# Financial Pipeline Dev Log
+# Financial Pipeline Dev Log
 
 > **Location:** `X:\dev\financial-pipeline-rs\DEV_LOG.md`  
 > **Purpose:** Living document of changes, errors, solutions. DC reads via project files. KALIC writes during work.
@@ -102,10 +102,51 @@
 **Fix:** Use local Yahoo price history instead of Finnhub /stock/candle
 **Prevention:** Finnhub free tier restricts candle data; always try local data first
 
+---
+
+## [2026-01-21] Paper Trading Simulator - Backend Complete
+**Author:** KALIC
+**Files:** `src/models.rs`, `src/db.rs`, `src/lib.rs`, `tauri-app/src-tauri/src/lib.rs`, `tauri-app/src/api.ts`
+**Summary:** Implemented paper trading system per TRADING_SIM_SPEC.md
+
+**Database:**
+- `paper_wallet` table - singleton with $100k starting cash
+- `paper_positions` table - open positions with entry price/date
+- `paper_trades` table - full trade history with P&L
+
+**Rust Models:**
+- `PaperWallet`, `PaperPosition`, `PaperTrade`, `PaperTradeAction` structs
+
+**Database Methods:**
+- `get_paper_wallet()` - get cash balance
+- `get_paper_positions()` / `get_paper_position(symbol)` - get positions
+- `execute_paper_trade(symbol, action, qty, price, ...)` - BUY/SELL with validation
+- `get_paper_trades(symbol, limit)` - trade history
+- `reset_paper_account(starting_cash)` - reset to clean state
+- `get_paper_portfolio_value()` - (cash, positions_value, total_equity)
+
+**Tauri Commands:**
+- `get_paper_balance` - wallet summary with P&L
+- `get_paper_positions` - positions with current prices and unrealized P&L
+- `execute_paper_trade` - execute trade (validates cash/shares)
+- `get_paper_trades` - trade history
+- `reset_paper_account` - reset account
+
+**TypeScript API (api.ts):**
+- Full type definitions and async functions for all commands
+
+**Build Status:** Compiles (both lib and tauri-app)
+
+**Next:** Frontend UI (sidebar panel for trading)
+
+---
+
 ## Pending / TODO
 
-- [x] Add price display to news cards (symbol price at time of news) ✅
-- [x] Integrate Finnhub `/news-sentiment` endpoint for bullish/bearish scores ✅ (used outcome-based instead)
+- [x] Add price display to news cards (symbol price at time of news)
+- [x] Integrate Finnhub `/news-sentiment` endpoint for bullish/bearish scores (used outcome-based instead)
+- [x] Paper trading backend (db, Tauri commands, TypeScript API)
+- [ ] Paper trading frontend UI (sidebar panel)
 - [ ] Vector learning hooks capturing KALIC tool executions
 
 ---
@@ -121,4 +162,51 @@
 
 | localhost:1420 refused | Run `npm run tauri dev` (starts Vite + Tauri together), OR `npm run build` first if using debug exe |
 | Frontend not bundled | Use `npm run tauri build`, NOT just `cargo build --release` |
+
+
+---
+
+## [2026-01-21] npm.ps1 Wrapper Broken in PowerShell
+**Author:** DC
+**Files:** C:\Program Files\nodejs\npm.ps1
+**Summary:** Node.js npm.ps1 wrapper script fails with $LASTEXITCODE not set error
+
+- npm.ps1 line 17 and 50 reference $LASTEXITCODE before it's initialized
+- Affects ALL pwsh sessions trying to run npm commands
+- KALIC was stuck in rebuild loop hitting this wall
+- **FIX:** Use cmd.exe shell instead of pwsh for npm/node commands
+
+### ❌ ERROR: npm fails in PowerShell
+**When:** Running 
+pm run dev or any npm command in pwsh
+**Fix:** Use cmd shell: cmd /c "npm run dev" OR create cmd-based terminal session
+**Prevention:** KALIC should use cmd shells for Node.js projects, not pwsh
+
+
+---
+
+## [2026-01-21] KALIC Report & Log Analysis Toolkit
+**Author:** DC
+**Files:** `tools\kalic_*.py`, `tools\kalic_*.bat`, `knowledge\KALIC_*.md`
+**Summary:** Complete PDF report generation and AI decision log analysis system
+
+**Scripts (X:\dev\financial-pipeline-rs\tools\):**
+- `kalic_log_analyzer.py` - Parses ai_decisions/*.jsonl, calculates metrics
+- `kalic_report_regen_v2.py` - PDF generator with AI performance section
+- `kalic_report_export.py` - Static snapshot PDF (data baked in)
+- `kalic_full_report.bat` - One-click: analyzer + PDF + JSON export
+- `kalic_regen.bat` / `kalic_export.bat` - Individual launchers
+
+**Documentation (X:\dev\financial-pipeline-rs\knowledge\):**
+- `KALIC_TOOLKIT_README.md` - Full toolkit documentation
+- `KALIC_REPORTS_README.md` - Original report docs
+
+**Features:**
+- 3-page PDF: Portfolio, Projections/Risk, AI Performance
+- Log analysis: action breakdown, confidence distribution, model stats
+- Markdown digest generation for daily review
+- JSON export for programmatic integration
+- Reads live from logs/ai_decisions/*.jsonl and reports/ai_trader_report_*.md
+
+**Dependency:** `pip install reportlab`
 
