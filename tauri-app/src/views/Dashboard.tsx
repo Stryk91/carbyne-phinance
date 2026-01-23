@@ -1,5 +1,6 @@
-import { Component, For } from 'solid-js';
-import { formatCurrency, formatPercent, formatCompact } from '../utils';
+import { Component, For, createSignal } from 'solid-js';
+import { TradingChart, OHLCData } from '../components/charts';
+import { formatCurrency, formatPercent } from '../utils';
 
 interface StatCard {
   label: string;
@@ -35,7 +36,65 @@ const topMovers: TopMover[] = [
   { symbol: 'TSLA', name: 'Tesla Inc.', price: 248.42, change: -3.45, volume: '89.5M', marketCap: '791.2B' },
 ];
 
+// Generate 30 days of realistic OHLC data for AAPL starting at $175
+const generateMockOHLCData = (): OHLCData[] => {
+  const data: OHLCData[] = [];
+  let basePrice = 175;
+  const startDate = new Date('2024-12-01');
+  
+  for (let i = 0; i < 30; i++) {
+    const date = new Date(startDate);
+    date.setDate(startDate.getDate() + i);
+    
+    // Skip weekends
+    if (date.getDay() === 0 || date.getDay() === 6) continue;
+    
+    // Generate realistic price movement
+    const volatility = 0.02; // 2% daily volatility
+    const trend = 0.001; // Slight upward trend
+    const randomWalk = (Math.random() - 0.5) * 2 * volatility;
+    
+    const open = basePrice * (1 + (Math.random() - 0.5) * 0.005);
+    const close = basePrice * (1 + randomWalk + trend);
+    const high = Math.max(open, close) * (1 + Math.random() * 0.01);
+    const low = Math.min(open, close) * (1 - Math.random() * 0.01);
+    
+    // Generate realistic volume (40M - 80M shares)
+    const volume = Math.floor(40000000 + Math.random() * 40000000);
+    
+    data.push({
+      time: date.toISOString().split('T')[0],
+      open: parseFloat(open.toFixed(2)),
+      high: parseFloat(high.toFixed(2)),
+      low: parseFloat(low.toFixed(2)),
+      close: parseFloat(close.toFixed(2)),
+      volume,
+    });
+    
+    basePrice = close;
+  }
+  
+  return data;
+};
+
+const mockAAPLData = generateMockOHLCData();
+
+// Calculate current price info from mock data
+const lastCandle = mockAAPLData[mockAAPLData.length - 1];
+const prevCandle = mockAAPLData[mockAAPLData.length - 2];
+const priceChange = lastCandle.close - prevCandle.close;
+const priceChangePercent = (priceChange / prevCandle.close) * 100;
+
+type ChartType = 'candlestick' | 'line' | 'area';
+type Timeframe = '1D' | '1W' | '1M' | '3M' | '1Y' | 'ALL';
+
 export const Dashboard: Component = () => {
+  const [chartType, setChartType] = createSignal<ChartType>('candlestick');
+  const [activeTimeframe, setActiveTimeframe] = createSignal<Timeframe>('1M');
+  const [showVolume, setShowVolume] = createSignal(true);
+
+  const timeframes: Timeframe[] = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
+
   return (
     <div class="editor-content">
       <div class="stats-grid" style={{ 'margin-bottom': 'var(--space-4)' }}>
@@ -54,39 +113,83 @@ export const Dashboard: Component = () => {
         </For>
       </div>
 
-      <div class="chart-container" style={{ height: '350px', 'margin-bottom': 'var(--space-4)' }}>
+      <div class="chart-container" style={{ height: '380px', 'margin-bottom': 'var(--space-4)' }}>
         <div class="chart-toolbar">
           <div style={{ display: 'flex', 'align-items': 'center', gap: 'var(--space-4)' }}>
             <span class="chart-symbol">AAPL</span>
             <span class="text-muted">Apple Inc.</span>
-            <span class="text-up">$178.72</span>
-            <span class="text-up">+$4.12 (+2.36%)</span>
+            <span class={priceChange >= 0 ? 'text-up' : 'text-down'}>
+              {formatCurrency(lastCandle.close)}
+            </span>
+            <span class={priceChange >= 0 ? 'text-up' : 'text-down'}>
+              {priceChange >= 0 ? '+' : ''}{formatCurrency(priceChange)} ({priceChange >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%)
+            </span>
           </div>
-          <div class="chart-timeframes">
-            <button class="timeframe-btn">1D</button>
-            <button class="timeframe-btn">1W</button>
-            <button class="timeframe-btn active">1M</button>
-            <button class="timeframe-btn">3M</button>
-            <button class="timeframe-btn">1Y</button>
-            <button class="timeframe-btn">ALL</button>
+          <div style={{ display: 'flex', 'align-items': 'center', gap: 'var(--space-3)' }}>
+            {/* Chart Type Selector */}
+            <div class="chart-type-selector" style={{ display: 'flex', gap: 'var(--space-1)' }}>
+              <button
+                class={`btn btn-icon btn-ghost ${chartType() === 'candlestick' ? 'active' : ''}`}
+                onClick={() => setChartType('candlestick')}
+                title="Candlestick"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M9 4v16M9 8h6v8H9zM15 4v16M15 6h4v4h-4zM15 14h4v4h-4z" />
+                </svg>
+              </button>
+              <button
+                class={`btn btn-icon btn-ghost ${chartType() === 'line' ? 'active' : ''}`}
+                onClick={() => setChartType('line')}
+                title="Line"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                </svg>
+              </button>
+              <button
+                class={`btn btn-icon btn-ghost ${chartType() === 'area' ? 'active' : ''}`}
+                onClick={() => setChartType('area')}
+                title="Area"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M3 20h18V10l-6 4-4-8-4 6-4 2v6z" />
+                </svg>
+              </button>
+              <button
+                class={`btn btn-icon btn-ghost ${showVolume() ? 'active' : ''}`}
+                onClick={() => setShowVolume(!showVolume())}
+                title="Toggle Volume"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="4" y="14" width="4" height="6" />
+                  <rect x="10" y="10" width="4" height="10" />
+                  <rect x="16" y="6" width="4" height="14" />
+                </svg>
+              </button>
+            </div>
+            {/* Timeframe Selector */}
+            <div class="chart-timeframes">
+              <For each={timeframes}>
+                {(tf) => (
+                  <button
+                    class={`timeframe-btn ${activeTimeframe() === tf ? 'active' : ''}`}
+                    onClick={() => setActiveTimeframe(tf)}
+                  >
+                    {tf}
+                  </button>
+                )}
+              </For>
+            </div>
           </div>
         </div>
-        <div class="chart-area" style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'center', color: 'var(--text-tertiary)' }}>
-          <svg width="600" height="200" viewBox="0 0 600 200">
-            <defs>
-              <linearGradient id="chartGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                <stop offset="0%" style="stop-color:#4ec9b0;stop-opacity:0.3"/>
-                <stop offset="100%" style="stop-color:#4ec9b0;stop-opacity:0"/>
-              </linearGradient>
-            </defs>
-            <path d="M0,150 L50,140 L100,120 L150,130 L200,100 L250,90 L300,95 L350,70 L400,60 L450,80 L500,50 L550,40 L600,30 L600,200 L0,200 Z" fill="url(#chartGradient)"/>
-            <path d="M0,150 L50,140 L100,120 L150,130 L200,100 L250,90 L300,95 L350,70 L400,60 L450,80 L500,50 L550,40 L600,30" fill="none" stroke="#4ec9b0" stroke-width="2"/>
-            <g stroke="#3c3c3c" stroke-width="1" opacity="0.5">
-              <line x1="0" y1="50" x2="600" y2="50"/>
-              <line x1="0" y1="100" x2="600" y2="100"/>
-              <line x1="0" y1="150" x2="600" y2="150"/>
-            </g>
-          </svg>
+        <div class="chart-area">
+          <TradingChart
+            symbol="AAPL"
+            data={mockAAPLData}
+            chartType={chartType()}
+            height={320}
+            showVolume={showVolume()}
+          />
         </div>
       </div>
 
