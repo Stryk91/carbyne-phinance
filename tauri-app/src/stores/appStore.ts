@@ -9,7 +9,7 @@ export type ViewType =
   | 'alerts' 
   | 'settings';
 
-export type PanelTab = 'log' | 'alerts' | 'ai-chat';
+export type PanelTab = 'terminal' | 'problems' | 'output';
 
 interface AppState {
   activeView: ViewType;
@@ -27,7 +27,7 @@ const initialState: AppState = {
   sidebarCollapsed: false,
   panelHeight: 200,
   panelCollapsed: false,
-  panelTab: 'log',
+  panelTab: 'terminal',
   commandPaletteOpen: false,
 };
 
@@ -56,8 +56,16 @@ export const appStore = {
     setState('panelCollapsed', !state.panelCollapsed);
   },
   
+  showPanel() {
+    setState('panelCollapsed', false);
+  },
+  
   setPanelTab(tab: PanelTab) {
     setState('panelTab', tab);
+    // Auto-show panel when switching tabs
+    if (state.panelCollapsed) {
+      setState('panelCollapsed', false);
+    }
   },
   
   openCommandPalette() {
@@ -71,4 +79,65 @@ export const appStore = {
   toggleCommandPalette() {
     setState('commandPaletteOpen', !state.commandPaletteOpen);
   },
+  
+  // Focus terminal (called from keyboard shortcut)
+  focusTerminal() {
+    setState('panelCollapsed', false);
+    setState('panelTab', 'terminal');
+    // Use the exposed function from Panel component
+    setTimeout(() => {
+      if ((window as any).__focusTerminal) {
+        (window as any).__focusTerminal();
+      }
+    }, 50);
+  },
+};
+
+// Keyboard shortcuts handler
+export const setupKeyboardShortcuts = () => {
+  const handleKeyDown = (e: KeyboardEvent) => {
+    // Ctrl+Shift+P - Command Palette
+    if (e.ctrlKey && e.shiftKey && e.key === 'P') {
+      e.preventDefault();
+      appStore.toggleCommandPalette();
+      return;
+    }
+    
+    // Ctrl+B - Toggle Sidebar
+    if (e.ctrlKey && !e.shiftKey && e.key === 'b') {
+      e.preventDefault();
+      appStore.toggleSidebar();
+      return;
+    }
+    
+    // Ctrl+J - Toggle Bottom Panel
+    if (e.ctrlKey && !e.shiftKey && e.key === 'j') {
+      e.preventDefault();
+      appStore.togglePanel();
+      return;
+    }
+    
+    // Ctrl+` - Focus Terminal
+    if (e.ctrlKey && e.key === '`') {
+      e.preventDefault();
+      appStore.focusTerminal();
+      return;
+    }
+    
+    // Escape - Close command palette
+    if (e.key === 'Escape') {
+      if (state.commandPaletteOpen) {
+        e.preventDefault();
+        appStore.closeCommandPalette();
+      }
+      return;
+    }
+  };
+  
+  window.addEventListener('keydown', handleKeyDown);
+  
+  // Return cleanup function
+  return () => {
+    window.removeEventListener('keydown', handleKeyDown);
+  };
 };

@@ -1,4 +1,4 @@
-export { appStore } from './appStore';
+export { appStore, setupKeyboardShortcuts } from './appStore';
 export type { ViewType, PanelTab } from './appStore';
 
 export { symbolStore } from './symbolStore';

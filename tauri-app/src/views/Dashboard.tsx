@@ -1,5 +1,6 @@
-import { Component, For, createSignal } from 'solid-js';
+import { Component, For, createSignal, createEffect, createMemo } from 'solid-js';
 import { TradingChart, OHLCData } from '../components/charts';
+import { symbolStore } from '../stores';
 import { formatCurrency, formatPercent } from '../utils';
 
 interface StatCard {
@@ -36,10 +37,22 @@ const topMovers: TopMover[] = [
   { symbol: 'TSLA', name: 'Tesla Inc.', price: 248.42, change: -3.45, volume: '89.5M', marketCap: '791.2B' },
 ];
 
-// Generate 30 days of realistic OHLC data for AAPL starting at $175
-const generateMockOHLCData = (): OHLCData[] => {
+// Symbol metadata for chart display
+const symbolMetadata: Record<string, { name: string; price: number; change: number }> = {
+  'AAPL': { name: 'Apple Inc.', price: 178.72, change: 2.36 },
+  'NVDA': { name: 'NVIDIA Corporation', price: 875.28, change: 5.67 },
+  'MSFT': { name: 'Microsoft Corporation', price: 415.50, change: -0.89 },
+  'GOOGL': { name: 'Alphabet Inc.', price: 141.80, change: 1.23 },
+  'AMZN': { name: 'Amazon.com Inc.', price: 178.25, change: -0.56 },
+  'META': { name: 'Meta Platforms Inc.', price: 485.23, change: 1.87 },
+  'TSLA': { name: 'Tesla Inc.', price: 248.42, change: -3.45 },
+  'AMD': { name: 'Advanced Micro Devices', price: 178.45, change: 4.12 },
+};
+
+// Generate realistic OHLC data for any symbol
+const generateOHLCData = (basePrice: number, trend: 'up' | 'down' | 'flat' = 'up'): OHLCData[] => {
   const data: OHLCData[] = [];
-  let basePrice = 175;
+  let price = basePrice * 0.92; // Start lower to show growth
   const startDate = new Date('2024-12-01');
   
   for (let i = 0; i < 30; i++) {
@@ -50,16 +63,16 @@ const generateMockOHLCData = (): OHLCData[] => {
     if (date.getDay() === 0 || date.getDay() === 6) continue;
     
     // Generate realistic price movement
-    const volatility = 0.02; // 2% daily volatility
-    const trend = 0.001; // Slight upward trend
+    const volatility = 0.02;
+    const trendFactor = trend === 'up' ? 0.002 : trend === 'down' ? -0.002 : 0;
     const randomWalk = (Math.random() - 0.5) * 2 * volatility;
     
-    const open = basePrice * (1 + (Math.random() - 0.5) * 0.005);
-    const close = basePrice * (1 + randomWalk + trend);
+    const open = price * (1 + (Math.random() - 0.5) * 0.005);
+    const close = price * (1 + randomWalk + trendFactor);
     const high = Math.max(open, close) * (1 + Math.random() * 0.01);
     const low = Math.min(open, close) * (1 - Math.random() * 0.01);
     
-    // Generate realistic volume (40M - 80M shares)
+    // Generate realistic volume
     const volume = Math.floor(40000000 + Math.random() * 40000000);
     
     data.push({
@@ -71,19 +84,28 @@ const generateMockOHLCData = (): OHLCData[] => {
       volume,
     });
     
-    basePrice = close;
+    price = close;
   }
   
   return data;
 };
 
-const mockAAPLData = generateMockOHLCData();
+// Cache for generated OHLC data
+const ohlcCache: Record<string, OHLCData[]> = {};
 
-// Calculate current price info from mock data
-const lastCandle = mockAAPLData[mockAAPLData.length - 1];
-const prevCandle = mockAAPLData[mockAAPLData.length - 2];
-const priceChange = lastCandle.close - prevCandle.close;
-const priceChangePercent = (priceChange / prevCandle.close) * 100;
+const getOHLCData = (symbol: string): OHLCData[] => {
+  if (!ohlcCache[symbol]) {
+    const meta = symbolMetadata[symbol];
+    if (meta) {
+      const trend = meta.change > 0 ? 'up' : meta.change < 0 ? 'down' : 'flat';
+      ohlcCache[symbol] = generateOHLCData(meta.price, trend);
+    } else {
+      // Default data for unknown symbols
+      ohlcCache[symbol] = generateOHLCData(100, 'flat');
+    }
+  }
+  return ohlcCache[symbol];
+};
 
 type ChartType = 'candlestick' | 'line' | 'area';
 type Timeframe = '1D' | '1W' | '1M' | '3M' | '1Y' | 'ALL';
@@ -94,6 +116,34 @@ export const Dashboard: Component = () => {
   const [showVolume, setShowVolume] = createSignal(true);
 
   const timeframes: Timeframe[] = ['1D', '1W', '1M', '3M', '1Y', 'ALL'];
+
+  // Reactive symbol data
+  const currentSymbol = () => symbolStore.state.selectedSymbol || 'AAPL';
+  
+  const currentMeta = createMemo(() => {
+    const sym = currentSymbol();
+    return symbolMetadata[sym] || { name: sym, price: 100, change: 0 };
+  });
+
+  const chartData = createMemo(() => {
+    return getOHLCData(currentSymbol());
+  });
+
+  // Calculate price info from chart data
+  const priceInfo = createMemo(() => {
+    const data = chartData();
+    if (data.length < 2) return { change: 0, changePercent: 0 };
+    const lastCandle = data[data.length - 1];
+    const prevCandle = data[data.length - 2];
+    const change = lastCandle.close - prevCandle.close;
+    const changePercent = (change / prevCandle.close) * 100;
+    return { change, changePercent, lastPrice: lastCandle.close };
+  });
+
+  // Handle row click in top movers table
+  const handleMoverClick = (symbol: string) => {
+    symbolStore.selectSymbol(symbol);
+  };
 
   return (
     <div class="editor-content">
@@ -116,13 +166,13 @@ export const Dashboard: Component = () => {
       <div class="chart-container" style={{ height: '380px', 'margin-bottom': 'var(--space-4)' }}>
         <div class="chart-toolbar">
           <div style={{ display: 'flex', 'align-items': 'center', gap: 'var(--space-4)' }}>
-            <span class="chart-symbol">AAPL</span>
-            <span class="text-muted">Apple Inc.</span>
-            <span class={priceChange >= 0 ? 'text-up' : 'text-down'}>
-              {formatCurrency(lastCandle.close)}
+            <span class="chart-symbol">{currentSymbol()}</span>
+            <span class="text-muted">{currentMeta().name}</span>
+            <span class={priceInfo().change >= 0 ? 'text-up' : 'text-down'}>
+              {formatCurrency(priceInfo().lastPrice || currentMeta().price)}
             </span>
-            <span class={priceChange >= 0 ? 'text-up' : 'text-down'}>
-              {priceChange >= 0 ? '+' : ''}{formatCurrency(priceChange)} ({priceChange >= 0 ? '+' : ''}{priceChangePercent.toFixed(2)}%)
+            <span class={priceInfo().change >= 0 ? 'text-up' : 'text-down'}>
+              {priceInfo().change >= 0 ? '+' : ''}{formatCurrency(priceInfo().change)} ({priceInfo().change >= 0 ? '+' : ''}{priceInfo().changePercent.toFixed(2)}%)
             </span>
           </div>
           <div style={{ display: 'flex', 'align-items': 'center', gap: 'var(--space-3)' }}>
@@ -184,8 +234,8 @@ export const Dashboard: Component = () => {
         </div>
         <div class="chart-area">
           <TradingChart
-            symbol="AAPL"
-            data={mockAAPLData}
+            symbol={currentSymbol()}
+            data={chartData()}
             chartType={chartType()}
             height={320}
             showVolume={showVolume()}
@@ -224,7 +274,10 @@ export const Dashboard: Component = () => {
             <tbody>
               <For each={topMovers}>
                 {(stock) => (
-                  <tr>
+                  <tr 
+                    class={`clickable-row ${symbolStore.state.selectedSymbol === stock.symbol ? 'selected' : ''}`}
+                    onClick={() => handleMoverClick(stock.symbol)}
+                  >
                     <td class="mono" style={{ 'font-weight': '600' }}>{stock.symbol}</td>
                     <td>{stock.name}</td>
                     <td class="mono">{formatCurrency(stock.price)}</td>
