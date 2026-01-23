@@ -1,21 +1,17 @@
-import { defineConfig } from "vite";
+import { defineConfig } from 'vite';
+import solid from 'vite-plugin-solid';
 
-// https://vitejs.dev/config/
 export default defineConfig({
-  // Prevent vite from obscuring rust errors
+  plugins: [solid()],
   clearScreen: false,
-  // Tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,
     strictPort: true,
-    watch: {
-      // Tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
-    },
   },
-  // To access Tauri APIs, build output should be placed in `dist`
+  envPrefix: ['VITE_', 'TAURI_'],
   build: {
-    outDir: "dist",
-    emptyOutDir: true,
+    target: ['es2021', 'chrome100', 'safari13'],
+    minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
+    sourcemap: !!process.env.TAURI_DEBUG,
   },
 });

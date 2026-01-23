@@ -1,0 +1,83 @@
+:root {
+  /* Background */
+  --bg-base: #1e1e1e;
+  --bg-surface: #252526;
+  --bg-elevated: #2d2d2d;
+  --bg-overlay: #3c3c3c;
+  --bg-activity: #333333;
+  --bg-activity-active: #505050;
+  --bg-input: #3c3c3c;
+  --bg-hover: #2a2d2e;
+  --bg-selected: #094771;
+
+  /* Borders */
+  --border-subtle: #3c3c3c;
+  --border-default: #474747;
+  --border-strong: #6b6b6b;
+  --border-focus: #007acc;
+
+  /* Text */
+  --text-primary: #cccccc;
+  --text-secondary: #969696;
+  --text-tertiary: #6e6e6e;
+  --text-inverse: #1e1e1e;
+  --text-link: #3794ff;
+
+  /* Accent */
+  --accent-primary: #0078d4;
+  --accent-secondary: #3794ff;
+  --accent-focus: #007acc;
+
+  /* Semantic */
+  --color-success: #4ec9b0;
+  --color-success-muted: #2d5a4a;
+  --color-error: #f14c4c;
+  --color-error-muted: #5a2d2d;
+  --color-warning: #cca700;
+  --color-warning-muted: #5a4d1e;
+  --color-info: #3794ff;
+
+  /* Financial */
+  --price-up: #4ec9b0;
+  --price-down: #f14c4c;
+  --price-neutral: #969696;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+
+  /* Font Sizes */
+  --text-xs: 0.6875rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.5rem;
+
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Layout */
+  --activity-bar-width: 48px;
+  --sidebar-width: 260px;
+  --sidebar-min: 180px;
+  --sidebar-max: 400px;
+  --panel-height: 200px;
+  --status-bar-height: 22px;
+  --titlebar-height: 30px;
+
+  /* Transitions */
+  --transition-fast: 0.1s ease;
+  --transition-normal: 0.2s ease;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 16px rgba(0, 0, 0, 0.5);
+}
