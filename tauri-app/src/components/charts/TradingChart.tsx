@@ -246,11 +246,36 @@ export const TradingChart: Component<TradingChartProps> = (props) => {
     window.addEventListener('resize', handleResize);
   });
 
+  // Track previous chart type to detect changes
+  let prevChartType = props.chartType || 'candlestick';
+  let prevShowVolume = props.showVolume;
+
+  // Reinitialize chart when type changes (need to recreate series)
+  const reinitializeChart = () => {
+    if (chart) {
+      chart.remove();
+      chart = undefined;
+      mainSeries = undefined;
+      volumeSeries = undefined;
+    }
+    initChart();
+  };
+
   // Update data when props change
   createEffect(() => {
     const data = props.data;
     const chartType = props.chartType || 'candlestick';
+    const showVol = props.showVolume;
 
+    // If chart type or volume toggle changed, reinitialize the whole chart
+    if (chartType !== prevChartType || showVol !== prevShowVolume) {
+      prevChartType = chartType;
+      prevShowVolume = showVol;
+      reinitializeChart();
+      return;
+    }
+
+    // Otherwise just update the data
     if (mainSeries && data.length > 0) {
       if (chartType === 'candlestick') {
         (mainSeries as ISeriesApi<'Candlestick'>).setData(getCandlestickData());
@@ -258,7 +283,7 @@ export const TradingChart: Component<TradingChartProps> = (props) => {
         (mainSeries as ISeriesApi<'Line'> | ISeriesApi<'Area'>).setData(getLineData());
       }
 
-      if (volumeSeries && props.showVolume) {
+      if (volumeSeries && showVol) {
         volumeSeries.setData(getVolumeData());
       }
 

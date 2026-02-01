@@ -1,12 +1,14 @@
 import { createStore } from 'solid-js/store';
 
-export type ViewType = 
-  | 'dashboard' 
-  | 'symbols' 
-  | 'charts' 
-  | 'portfolio' 
-  | 'ai-trader' 
-  | 'alerts' 
+export type ViewType =
+  | 'dashboard'
+  | 'symbols'
+  | 'charts'
+  | 'portfolio'
+  | 'ai-trader'
+  | 'trade-queue'
+  | 'alerts'
+  | 'reports'
   | 'settings';
 
 export type PanelTab = 'terminal' | 'problems' | 'output';

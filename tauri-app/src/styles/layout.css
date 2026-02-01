@@ -1,10 +1,9 @@
 /* App Shell */
 .app-container {
   display: grid;
-  grid-template-rows: var(--titlebar-height) 1fr var(--status-bar-height);
+  grid-template-rows: 1fr var(--status-bar-height);
   grid-template-columns: var(--activity-bar-width) var(--sidebar-width) 1fr;
   grid-template-areas:
-    "titlebar titlebar titlebar"
     "activity sidebar main"
     "status status status";
   height: 100vh;
@@ -185,6 +184,9 @@
 
 .editor-tabs {
   background: var(--bg-surface);
+  background-image: url('../assets/textures/brushed_metal_dark.svg');
+  background-size: 512px 512px;
+  background-blend-mode: overlay;
   display: flex;
   align-items: stretch;
   border-bottom: 1px solid var(--border-subtle);
@@ -315,3 +317,4 @@
 
 .status-dot.warning { background: var(--color-warning); }
 .status-dot.error { background: var(--color-error); }
+.status-dot.closed { background: #6e6e6e; }

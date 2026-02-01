@@ -20,7 +20,7 @@ async fn main() {
     
     // 2. Load NVDA data from database
     println!("2. Loading NVDA data from database...");
-    let db_path = r"X:\dev\financial-pipeline-rs\data\finance.db";
+    let db_path = r"X:\dev\carbyne-phinance/fp-tauri-dev\data\finance.db";
     let db = match Database::open(db_path) {
         Ok(d) => d,
         Err(e) => {

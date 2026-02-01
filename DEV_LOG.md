@@ -255,3 +255,119 @@ pm run dev or any npm command in pwsh
 
 **Dependency:** `pip install reportlab`
 
+
+---
+
+## 2026-01-27: Major Cleanup - Project Consolidation (KALIC)
+
+### Problem Discovered
+Two cloned projects (financial-pipeline-rs and carbyne-phinance) were cross-contaminated:
+- carbyne-phinance code had hardcoded paths to financial-pipeline-rs
+- Both tauri apps shared same dev port (localhost:1420)
+- Running financial-pipeline-rs exe showed carbyne UI because carbyne's vite server was on 1420
+
+### Root Cause: Shared Dev Port Architecture
+```
+VITE DEV SERVER (carbyne-phinance)
+  └── localhost:1420
+        ▲
+        │ Both exes connect here
+        │
+  ┌─────┴─────┐
+  │           │
+financial-   carbyne-
+pipeline-rs  phinance
+exe          (no exe built)
+```
+
+The exe from financial-pipeline-rs + vite from carbyne = mixed UI.
+
+### Cleanup Actions Taken
+
+| Step | Action |
+|------|--------|
+| 1 | Deleted dead `carbyne-phinance/repo/` folder (stale clone) |
+| 2 | Fixed 9 files with hardcoded paths → `carbyne-phinance/fp-tauri-dev` |
+| 3 | Copied latest database (24.9MB) from financial-pipeline-rs |
+| 4 | Created missing dirs: reports, logs/trading_sim_logs, tools |
+| 5 | Copied missing features: audit_reports, mcp-cdp, tools, requirements.txt |
+| 6 | Verified Rust build ✓ (compiles clean) |
+
+### Files Modified (path fixes)
+- examples/ai_trader_full_cycle.rs
+- examples/ai_trader_live_test.rs
+- examples/check_db_state.rs
+- examples/fix_db.rs
+- examples/init_ai_tables.rs
+- examples/ollama_nvda_test.rs
+- examples/update_ai_config.rs
+- tauri-app/src-tauri/src/http_api.rs
+- tauri-app/src-tauri/src/lib.rs
+
+### Current State
+- **carbyne-phinance/fp-tauri-dev**: Single source of truth
+- **financial-pipeline-rs**: Kept as reference only (do not use)
+- **Vite dev server**: Running from carbyne-phinance on port 1420
+
+### TODO
+- [ ] Build carbyne-phinance exe for standalone use
+- [ ] Consider archiving/deleting financial-pipeline-rs after full verification
+
+---
+
+## 2026-01-27: UI Bug Fixes & Feature Enhancements (KALIC)
+
+**Author:** KALIC
+**Files:** `src-tauri/src/lib.rs`, `src/api.ts`, `src/views/Portfolio.tsx`, `src/views/Dashboard.tsx`, `src/views/Charts.tsx`, `src/views/Symbols.tsx`, `src/components/charts/TradingChart.tsx`, `src/components/layout/ActivityBar.tsx`, `src/styles/components.css`
+
+### Bug Fixes
+
+| Issue | Fix |
+|-------|-----|
+| **P&L showing 924% instead of ~2.46%** | Hardcoded $100k starting capital in `lib.rs:2352` and `api.ts:468,602` changed to $1M (matching DB default) |
+| **Notification badge always showing "3"** | ActivityBar had hardcoded badge values - now fetches real triggered alert count and symbol count dynamically |
+| **Charts: Timeframe buttons not working** | Added `filterByTimeframe()` function to `Charts.tsx` and `Dashboard.tsx` - filters data by 1D/1W/1M/3M/1Y/ALL |
+| **Charts: Line/Area chart types broken** | TradingChart wasn't reinitializing on chartType change - added `reinitializeChart()` that removes and recreates chart on prop changes |
+| **Charts: Volume toggle not working** | Same fix - tracked `prevShowVolume` and reinitialize chart when toggle changes |
+
+### New Features
+
+**1. Real-Time Portfolio Updates (10 second refresh)**
+- `Portfolio.tsx`: Auto-refresh all portfolio data (balance, positions, trades, competition stats)
+- `Dashboard.tsx`: Auto-refresh competition stats and balance
+- Uses `onMount`/`onCleanup` lifecycle hooks with `setInterval`
+
+**2. Stop-Loss / Take-Profit Price Alerts**
+- Added `handleSetStopLoss(symbol, price)` - creates alert at 5% below current price
+- Added `handleSetTakeProfit(symbol, price)` - creates alert at 15% above current price
+- New Actions column in Positions table with SL/TP buttons
+
+**3. Symbols & Watchlists - Bulk Add & Auto-Populate**
+- **Checkboxes** for multi-select symbols with Select All
+- **"Add X to Watchlist"** dropdown button when symbols are selected
+- **"Auto-Populate Groups"** dropdown with predefined categories:
+  - AI & Tech (15 stocks)
+  - Semiconductors (15 stocks)
+  - EV & Clean Energy (15 stocks)
+  - Finance (15 stocks)
+  - Healthcare (15 stocks)
+  - Consumer (15 stocks)
+  - Crypto-Related (10 stocks)
+- Individual symbol **"Add to Watchlist"** dropdown per row
+- CSS for bulk selection highlighting (`.bulk-selected` class)
+
+### Code Changes Summary
+
+```
+lib.rs:        Fixed starting_capital: 100000.0 → 1_000_000.0
+api.ts:        Fixed starting_capital: 100000 → 1000000 (2 locations)
+Portfolio.tsx: Added 10s refresh + SL/TP handlers + Actions column
+Dashboard.tsx: Added 10s refresh + timeframe filtering
+Charts.tsx:    Added timeframe filtering
+TradingChart:  Added reinitializeChart() for chartType/volume changes
+ActivityBar:   Dynamic badges from API (alerts + symbols count)
+Symbols.tsx:   Bulk selection + auto-populate + watchlist dropdowns
+components.css: Dropdown improvements + bulk selection styles
+```
+
+---

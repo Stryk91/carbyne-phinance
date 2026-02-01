@@ -596,6 +596,42 @@ pub struct CompetitionStats {
 }
 
 // ============================================================================
+// Trade Queue Types
+// ============================================================================
+
+/// A trade queued for scheduled execution (e.g. at market open)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedTrade {
+    pub id: i64,
+    pub portfolio: String,       // "KALIC" or "DC"
+    pub symbol: String,
+    pub action: String,          // "BUY" or "SELL"
+    pub quantity: f64,
+    pub target_price: Option<f64>,
+    pub status: String,          // queued, executing, executed, failed, cancelled
+    pub source: String,          // debate, signal_engine, manual
+    pub debate_date: Option<String>,
+    pub conviction: Option<i32>, // 1-10
+    pub reasoning: Option<String>,
+    pub created_at: String,
+    pub scheduled_for: Option<String>,
+    pub executed_at: Option<String>,
+    pub execution_price: Option<f64>,
+    pub execution_trade_id: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+/// Audit log entry for trade queue state changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueLogEntry {
+    pub id: i64,
+    pub queue_id: i64,
+    pub event: String,
+    pub details: Option<String>,
+    pub timestamp: String,
+}
+
+// ============================================================================
 // Confluence Signal Types
 // ============================================================================
 

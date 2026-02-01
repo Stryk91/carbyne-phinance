@@ -1,7 +1,14 @@
 import { Component, For, Show, createSignal, onMount, onCleanup } from 'solid-js';
 import { appStore } from '../../stores';
+import {
+  getSymbols,
+  getPortfolio,
+  fetchPrices,
+  getAlerts,
+  checkAlerts,
+} from '../../api';
 
-export type PanelTab = 'terminal' | 'problems' | 'output';
+export type PanelTab = 'activity' | 'problems' | 'output';
 
 interface LogEntry {
   id: number;
@@ -25,44 +32,52 @@ interface OutputMessage {
   timestamp: Date;
 }
 
-// Terminal state
-const [terminalLogs, setTerminalLogs] = createSignal<LogEntry[]>([
-  { id: 1, time: new Date(Date.now() - 300000), message: '$ tauri dev', type: 'command' },
-  { id: 2, time: new Date(Date.now() - 299000), message: '   Compiling financial-pipeline v0.2.0', type: 'output' },
-  { id: 3, time: new Date(Date.now() - 250000), message: '    Finished dev [unoptimized + debuginfo] target(s) in 12.34s', type: 'output' },
-  { id: 4, time: new Date(Date.now() - 200000), message: '        Info Watching for changes...', type: 'output' },
-  { id: 5, time: new Date(Date.now() - 150000), message: '[API] Connected to market data feed', type: 'output' },
-  { id: 6, time: new Date(Date.now() - 100000), message: '[API] Fetched prices for 156 symbols', type: 'output' },
-  { id: 7, time: new Date(Date.now() - 50000), message: '[AI] Model loaded: gpt-4-turbo', type: 'output' },
-  { id: 8, time: new Date(Date.now() - 30000), message: '[WARN] API rate limit: 23/25 calls used', type: 'error' },
-  { id: 9, time: new Date(Date.now() - 10000), message: '[AI] Analyzing 24 positions...', type: 'output' },
+// Activity log state - captures all app events
+const [activityLogs, setActivityLogs] = createSignal<LogEntry[]>([
+  { id: 1, time: new Date(), message: 'Ready', type: 'output' },
 ]);
 
-// Problems state
-const [problems, setProblems] = createSignal<Problem[]>([
-  { id: 1, severity: 'error', message: 'Failed to fetch FRED data: Connection timeout', source: 'API Gateway', timestamp: new Date(Date.now() - 432000) },
-  { id: 2, severity: 'warning', message: 'API rate limit approaching (92%)', source: 'Rate Limiter', timestamp: new Date(Date.now() - 93000) },
-  { id: 3, severity: 'warning', message: 'Stale price data for 3 symbols (>5min old)', source: 'Data Validator', timestamp: new Date(Date.now() - 60000) },
-  { id: 4, severity: 'info', message: 'Market closes in 2 hours', source: 'Scheduler', timestamp: new Date(Date.now() - 30000) },
-]);
+// Problems state - starts empty, populated by real errors
+const [problems, setProblems] = createSignal<Problem[]>([]);
 
-// Output state
-const [outputMessages, setOutputMessages] = createSignal<OutputMessage[]>([
-  { id: 1, channel: 'Market Data', message: 'WebSocket connected to wss://stream.data.alpaca.markets', timestamp: new Date(Date.now() - 300000) },
-  { id: 2, channel: 'Market Data', message: 'Subscribed to 156 symbols', timestamp: new Date(Date.now() - 295000) },
-  { id: 3, channel: 'AI Trader', message: 'Initialized with strategy: momentum_reversal_v2', timestamp: new Date(Date.now() - 200000) },
-  { id: 4, channel: 'AI Trader', message: 'Portfolio analysis complete: 24 positions evaluated', timestamp: new Date(Date.now() - 150000) },
-  { id: 5, channel: 'Alerts', message: 'Price alert triggered: NVDA crossed $870', timestamp: new Date(Date.now() - 50000) },
-  { id: 6, channel: 'System', message: 'Auto-save completed', timestamp: new Date(Date.now() - 10000) },
-]);
+// Output state - starts empty, populated by real events
+const [outputMessages, setOutputMessages] = createSignal<OutputMessage[]>([]);
 
-const [activeTab, setActiveTab] = createSignal<PanelTab>('terminal');
-const [terminalInput, setTerminalInput] = createSignal('');
-let terminalRef: HTMLDivElement | undefined;
+let activityRef: HTMLDivElement | undefined;
+
+// Scroll activity log to bottom when new entries added
+const scrollActivityToBottom = () => {
+  if (activityRef) {
+    activityRef.scrollTop = activityRef.scrollHeight;
+  }
+};
+
+// Helper to add log entry - EXPORTED for other components
+let logIdCounter = 3;
+export const addLog = (message: string, type: 'command' | 'output' | 'error' = 'output') => {
+  setActivityLogs(prev => [...prev, { id: logIdCounter++, time: new Date(), message, type }]);
+  // Auto-scroll after adding
+  setTimeout(scrollActivityToBottom, 10);
+};
+
+// Helper to add output message - EXPORTED for other components
+let outputIdCounter = 1;
+export const addOutput = (channel: string, message: string) => {
+  setOutputMessages(prev => [...prev, { id: outputIdCounter++, channel, message, timestamp: new Date() }]);
+};
+
+// Helper to add problem
+let problemIdCounter = 1;
+export const addProblem = (severity: 'error' | 'warning' | 'info', message: string, source: string) => {
+  setProblems(prev => [...prev, { id: problemIdCounter++, severity, message, source, timestamp: new Date() }]);
+};
+
+const [activeTab, setActiveTab] = createSignal<PanelTab>('activity');
+const [commandInput, setCommandInput] = createSignal('');
 let inputRef: HTMLInputElement | undefined;
 
 const tabs: { id: PanelTab; label: string; badge?: () => number }[] = [
-  { id: 'terminal', label: 'TERMINAL' },
+  { id: 'activity', label: 'ACTIVITY' },
   { id: 'problems', label: 'PROBLEMS', badge: () => problems().filter(p => p.severity === 'error').length },
   { id: 'output', label: 'OUTPUT' },
 ];
@@ -71,35 +86,146 @@ const formatTime = (date: Date): string => {
   return date.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 };
 
-const handleTerminalSubmit = (e: Event) => {
+const handleCommandSubmit = async (e: Event) => {
   e.preventDefault();
-  const cmd = terminalInput().trim();
+  const cmd = commandInput().trim();
   if (!cmd) return;
-  
-  const newId = terminalLogs().length + 1;
-  setTerminalLogs([...terminalLogs(), { id: newId, time: new Date(), message: `$ ${cmd}`, type: 'command' }]);
-  
-  // Simulate command response
-  setTimeout(() => {
-    let response = '';
-    if (cmd === 'help') {
-      response = 'Available commands: help, clear, status, refresh, positions';
-    } else if (cmd === 'clear') {
-      setTerminalLogs([]);
-      return;
-    } else if (cmd === 'status') {
-      response = 'System Status: OK | API: Connected | Positions: 24 | P&L: +$9,132.30';
-    } else if (cmd === 'refresh') {
-      response = 'Refreshing market data...';
-    } else if (cmd === 'positions') {
-      response = 'NVDA: +$6,264 | AAPL: +$2,744 | META: +$1,409 | MSFT: -$337 | TSLA: -$947';
-    } else {
-      response = `Command not found: ${cmd}. Type 'help' for available commands.`;
+
+  addLog(`> ${cmd}`, 'command');
+  setCommandInput('');
+
+  const parts = cmd.split(/\s+/);
+  const command = parts[0].toLowerCase();
+  const args = parts.slice(1);
+
+  try {
+    switch (command) {
+      case 'help':
+        addLog('Available commands:');
+        addLog('  help                    - Show this help');
+        addLog('  clear                   - Clear activity log');
+        addLog('  status                  - Show system status');
+        addLog('  symbols                 - List all symbols');
+        addLog('  positions               - Show portfolio positions');
+        addLog('  fetch <symbols>         - Fetch prices (e.g., fetch AAPL,NVDA)');
+        addLog('  refresh                 - Refresh all favorited symbols');
+        addLog('  alerts                  - Check and list active alerts');
+        break;
+
+      case 'clear':
+        setActivityLogs([]);
+        break;
+
+      case 'status':
+        addLog('Fetching status...', 'output');
+        try {
+          const symbols = await getSymbols();
+          const portfolio = await getPortfolio();
+          addLog(`Symbols: ${symbols.length} loaded`);
+          addLog(`Positions: ${portfolio.positions.length} active`);
+          addLog(`Total P&L: $${portfolio.total_profit_loss.toFixed(2)}`);
+          addOutput('System', `Status check: ${symbols.length} symbols, ${portfolio.positions.length} positions`);
+        } catch (err) {
+          addLog(`Error: ${err}`, 'error');
+          addProblem('error', `Status check failed: ${err}`, 'Terminal');
+        }
+        break;
+
+      case 'symbols':
+        try {
+          const symbols = await getSymbols();
+          addLog(`Loaded ${symbols.length} symbols:`);
+          const top10 = symbols.slice(0, 10);
+          top10.forEach(s => {
+            const direction = s.change_direction === 'up' ? '+' : s.change_direction === 'down' ? '' : ' ';
+            addLog(`  ${s.symbol.padEnd(6)} $${s.price.toFixed(2).padStart(8)} ${direction}${s.change_percent.toFixed(2)}%`);
+          });
+          if (symbols.length > 10) addLog(`  ... and ${symbols.length - 10} more`);
+        } catch (err) {
+          addLog(`Error: ${err}`, 'error');
+        }
+        break;
+
+      case 'positions':
+        try {
+          const portfolio = await getPortfolio();
+          if (portfolio.positions.length === 0) {
+            addLog('No positions found');
+          } else {
+            addLog(`Portfolio (${portfolio.positions.length} positions):`);
+            portfolio.positions.forEach((p: any) => {
+              const pnlSign = p.unrealized_pnl >= 0 ? '+' : '';
+              addLog(`  ${p.symbol.padEnd(6)} ${p.quantity} @ $${p.avg_cost.toFixed(2)} | P&L: ${pnlSign}$${p.unrealized_pnl.toFixed(2)}`);
+            });
+            addLog(`Total P&L: $${portfolio.total_profit_loss.toFixed(2)}`);
+          }
+        } catch (err) {
+          addLog(`Error: ${err}`, 'error');
+        }
+        break;
+
+      case 'fetch':
+        if (args.length === 0) {
+          addLog('Usage: fetch <symbols>  (e.g., fetch AAPL,NVDA,TSLA)', 'error');
+        } else {
+          const symbols = args.join(',').toUpperCase();
+          addLog(`Fetching prices for: ${symbols}...`);
+          try {
+            const result = await fetchPrices(symbols, '1mo');
+            addLog(result.message);
+            addOutput('Market Data', `Fetched: ${symbols}`);
+          } catch (err) {
+            addLog(`Error: ${err}`, 'error');
+            addProblem('error', `Fetch failed: ${err}`, 'Yahoo Finance');
+          }
+        }
+        break;
+
+      case 'refresh':
+        addLog('Refreshing favorited symbols...');
+        try {
+          const symbols = await getSymbols();
+          const favorited = symbols.filter(s => s.favorited).map(s => s.symbol);
+          if (favorited.length === 0) {
+            addLog('No favorited symbols to refresh');
+          } else {
+            addLog(`Refreshing ${favorited.length} symbols: ${favorited.join(', ')}`);
+            const result = await fetchPrices(favorited.join(','), '1d');
+            addLog(result.message);
+            addOutput('Market Data', `Refreshed ${favorited.length} symbols`);
+          }
+        } catch (err) {
+          addLog(`Error: ${err}`, 'error');
+        }
+        break;
+
+      case 'alerts':
+        try {
+          const triggeredAlerts = await checkAlerts();
+          if (triggeredAlerts.length > 0) {
+            addLog(`${triggeredAlerts.length} alerts triggered!`);
+          }
+          const alerts = await getAlerts(true);
+          if (alerts.length === 0) {
+            addLog('No active alerts');
+          } else {
+            addLog(`Active alerts (${alerts.length}):`);
+            alerts.forEach((a: any) => {
+              addLog(`  ${a.symbol}: ${a.condition} $${a.target_price}`);
+            });
+          }
+        } catch (err) {
+          addLog(`Error: ${err}`, 'error');
+        }
+        break;
+
+      default:
+        addLog(`Unknown command: ${command}. Type 'help' for available commands.`, 'error');
     }
-    setTerminalLogs([...terminalLogs(), { id: newId + 1, time: new Date(), message: response, type: 'output' }]);
-  }, 100);
-  
-  setTerminalInput('');
+  } catch (err) {
+    addLog(`Error executing command: ${err}`, 'error');
+    addProblem('error', `Command failed: ${cmd}`, 'Terminal');
+  }
 };
 
 const clearProblems = () => {
@@ -110,28 +236,21 @@ const clearOutput = () => {
   setOutputMessages([]);
 };
 
-// Scroll terminal to bottom when new logs added
-const scrollTerminalToBottom = () => {
-  if (terminalRef) {
-    terminalRef.scrollTop = terminalRef.scrollHeight;
-  }
-};
-
 export const Panel: Component = () => {
-  // Focus terminal input when terminal tab is active
-  const focusTerminal = () => {
-    if (activeTab() === 'terminal' && inputRef) {
+  // Focus activity input when activity tab is active
+  const focusActivityInput = () => {
+    if (activeTab() === 'activity' && inputRef) {
       inputRef.focus();
     }
   };
 
   // Expose focus function globally for keyboard shortcut
   onMount(() => {
-    (window as any).__focusTerminal = focusTerminal;
+    (window as any).__focusActivityInput = focusActivityInput;
   });
 
   onCleanup(() => {
-    delete (window as any).__focusTerminal;
+    delete (window as any).__focusActivityInput;
   });
 
   return (
@@ -154,8 +273,8 @@ export const Panel: Component = () => {
             </For>
           </div>
           <div style={{ display: 'flex', gap: '4px' }}>
-            <Show when={activeTab() === 'terminal'}>
-              <button class="btn btn-icon btn-ghost" title="Clear Terminal" onClick={() => setTerminalLogs([])}>
+            <Show when={activeTab() === 'activity'}>
+              <button class="btn btn-icon btn-ghost" title="Clear Activity" onClick={() => setActivityLogs([])}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
                 </svg>
@@ -191,26 +310,26 @@ export const Panel: Component = () => {
         
         <div class="panel-content">
           {/* TERMINAL Tab */}
-          <Show when={activeTab() === 'terminal'}>
-            <div class="terminal-container">
-              <div class="terminal-output" ref={terminalRef} onClick={focusTerminal}>
-                <For each={terminalLogs()}>
+          <Show when={activeTab() === 'activity'}>
+            <div class="activity-container">
+              <div class="activity-output" ref={activityRef} onClick={focusActivityInput}>
+                <For each={activityLogs()}>
                   {(entry) => (
-                    <div class={`terminal-line ${entry.type || ''}`}>
-                      <span class="terminal-time">[{formatTime(entry.time)}]</span>
-                      <span class="terminal-message">{entry.message}</span>
+                    <div class={`activity-line ${entry.type || ''}`}>
+                      <span class="activity-time">[{formatTime(entry.time)}]</span>
+                      <span class="activity-message">{entry.message}</span>
                     </div>
                   )}
                 </For>
               </div>
-              <form class="terminal-input-row" onSubmit={handleTerminalSubmit}>
-                <span class="terminal-prompt">$</span>
+              <form class="activity-input-row" onSubmit={handleCommandSubmit}>
+                <span class="activity-prompt">›</span>
                 <input
                   ref={inputRef}
                   type="text"
-                  class="terminal-input"
-                  value={terminalInput()}
-                  onInput={(e) => setTerminalInput(e.currentTarget.value)}
+                  class="activity-input"
+                  value={commandInput()}
+                  onInput={(e) => setCommandInput(e.currentTarget.value)}
                   placeholder="Type a command..."
                   spellcheck={false}
                   autocomplete="off"

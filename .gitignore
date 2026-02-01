@@ -105,3 +105,4 @@ reports/
 
 # Python venv
 .venv/
+data/*.corrupted*

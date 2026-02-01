@@ -1,5 +1,8 @@
 //! Tauri GUI backend for Financial Pipeline
 
+mod http_api;
+mod scheduler;
+
 use financial_pipeline::{
     calculate_all, AlertCondition, BacktestConfig, BacktestEngine, Database, Fred, GoogleTrends,
     IndicatorAlert, IndicatorAlertCondition, IndicatorAlertType, PositionType, SignalEngine,
@@ -16,24 +19,32 @@ use financial_pipeline::{
 use financial_pipeline::ollama::{OllamaClient, SentimentResult, PatternExplanation};
 use chrono::Utc;
 use serde::Serialize;
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{Arc, Mutex};
+use tauri::{State, Emitter, Manager};
 
 /// Get the absolute path to a data file
-/// Uses FP_DATA_DIR env var if set, otherwise defaults to absolute path for development
+/// Uses FP_DATA_DIR env var if set, otherwise auto-detects Windows vs WSL/Linux
 fn get_data_path(filename: &str) -> String {
-    let base = std::env::var("FP_DATA_DIR")
-        .unwrap_or_else(|_| {
-            // Default to absolute Windows path for the app (runs as Windows exe)
-            // Note: Use Windows path format (X:\...) not WSL format (/mnt/x/...)
-            r"X:\dev\financial-pipeline-rs\data".to_string()
-        });
-    format!("{}\\{}", base, filename)
+    // Check env var first
+    if let Ok(base) = std::env::var("FP_DATA_DIR") {
+        let sep = if cfg!(windows) { "\\" } else { "/" };
+        return format!("{}{}{}", base, sep, filename);
+    }
+
+    // Auto-detect environment
+    if cfg!(windows) {
+        // Windows native
+        format!(r"X:\dev\carbyne-phinance/fp-tauri-dev\data\{}", filename)
+    } else {
+        // WSL or Linux - use mount path
+        format!("/mnt/x/dev/carbyne-phinance/fp-tauri-dev/data/{}", filename)
+    }
 }
 
 /// Application state holding the database connection
+/// Uses Arc so the DB can be shared with the HTTP API server
 struct AppState {
-    db: Mutex<Database>,
+    db: Arc<Mutex<Database>>,
 }
 
 /// Symbol with latest price and percent change
@@ -163,6 +174,7 @@ fn favorite_paper_positions(state: State<AppState>) -> Result<CommandResult, Str
 /// Fetch stock prices from Yahoo Finance
 #[tauri::command]
 fn fetch_prices(
+    app: tauri::AppHandle,
     state: State<AppState>,
     symbols: String,
     period: String,
@@ -189,10 +201,25 @@ fn fetch_prices(
 
     for symbol in &symbol_list {
         match yahoo.fetch_and_store(&mut db, symbol, &period) {
-            Ok(_) => success_count += 1,
+            Ok(_) => {
+                success_count += 1;
+                // Emit price update event for each successful fetch
+                if let Ok(Some(price)) = db.get_latest_price(symbol) {
+                    let _ = app.emit("price-update", serde_json::json!({
+                        "symbol": symbol,
+                        "price": price
+                    }));
+                }
+            }
             Err(_) => fail_count += 1,
         }
     }
+
+    // Emit log event
+    let _ = app.emit("app-log", serde_json::json!({
+        "message": format!("Fetched {} symbols ({} success, {} failed)", symbol_list.len(), success_count, fail_count),
+        "level": if fail_count > 0 { "warning" } else { "info" }
+    }));
 
     Ok(CommandResult {
         success: fail_count == 0,
@@ -546,6 +573,7 @@ struct AlertData {
 /// Add a price alert
 #[tauri::command]
 fn add_alert(
+    app: tauri::AppHandle,
     state: State<AppState>,
     symbol: String,
     target_price: f64,
@@ -563,7 +591,11 @@ fn add_alert(
     db.add_alert(&symbol, target_price, alert_condition)
         .map_err(|e| e.to_string())?;
 
-    println!("[OK] Added alert for {} {} ${:.2}", symbol, condition, target_price);
+    // Emit app log event
+    let _ = app.emit("app-log", serde_json::json!({
+        "message": format!("Alert set: {} {} ${:.2}", symbol, condition, target_price),
+        "level": "info"
+    }));
 
     Ok(CommandResult {
         success: true,
@@ -609,10 +641,31 @@ fn delete_alert(state: State<AppState>, alert_id: i64) -> Result<CommandResult, 
 
 /// Check alerts against current prices
 #[tauri::command]
-fn check_alerts(state: State<AppState>) -> Result<Vec<AlertData>, String> {
+fn check_alerts(app: tauri::AppHandle, state: State<AppState>) -> Result<Vec<AlertData>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     let triggered = db.check_alerts().map_err(|e| e.to_string())?;
+
+    // Emit events for each triggered alert
+    for alert in &triggered {
+        let condition_str = match alert.condition {
+            AlertCondition::Above => "above",
+            AlertCondition::Below => "below",
+        };
+        let _ = app.emit("alert-triggered", serde_json::json!({
+            "symbol": alert.symbol,
+            "target_price": alert.target_price,
+            "condition": condition_str
+        }));
+    }
+
+    // Emit summary log if any alerts triggered
+    if !triggered.is_empty() {
+        let _ = app.emit("app-log", serde_json::json!({
+            "message": format!("{} alert(s) triggered", triggered.len()),
+            "level": "warning"
+        }));
+    }
 
     Ok(triggered
         .into_iter()
@@ -660,6 +713,7 @@ struct PortfolioSummary {
 /// Add a portfolio position
 #[tauri::command]
 fn add_position(
+    app: tauri::AppHandle,
     state: State<AppState>,
     symbol: String,
     quantity: f64,
@@ -680,10 +734,11 @@ fn add_position(
     db.add_position(&symbol, quantity, price, pos_type, &date, notes.as_deref())
         .map_err(|e| e.to_string())?;
 
-    println!(
-        "[OK] Added {} position: {} x {} @ ${:.2}",
-        position_type, quantity, symbol, price
-    );
+    // Emit position event to frontend
+    let _ = app.emit("app-log", serde_json::json!({
+        "message": format!("Position added: {} {} x {} @ ${:.2}", position_type, quantity, symbol, price),
+        "level": "info"
+    }));
 
     Ok(CommandResult {
         success: true,
@@ -2147,9 +2202,10 @@ struct FetchNewsResponse {
     count: usize,
 }
 
-/// Fetch news for a symbol from Finnhub API
+/// Fetch news for a symbol from Finnhub API (with local caching)
 #[tauri::command]
 fn fetch_news(
+    state: State<AppState>,
     symbol: String,
     api_key: String,
     limit: Option<usize>,
@@ -2162,12 +2218,228 @@ fn fetch_news(
         .map_err(|e| e.to_string())?;
 
     let news_limit = limit.unwrap_or(5);
-    let news = client.fetch_simple_news(&symbol, news_limit)
+
+    // Fetch full news items to get IDs for caching
+    let full_news = client.fetch_company_news(&symbol)
         .map_err(|e| e.to_string())?;
+
+    // Cache to local database
+    if let Ok(db) = state.db.lock() {
+        for item in &full_news {
+            let _ = db.save_news(
+                item.id,
+                &symbol,
+                &item.headline,
+                Some(&item.summary),
+                &item.source,
+                &item.url,
+                item.image.as_deref(),
+                item.datetime,
+            );
+        }
+        println!("[OK] Cached {} news items for {}", full_news.len(), symbol);
+    }
+
+    // Convert to simple format and limit
+    let news: Vec<SimpleNewsItem> = full_news
+        .into_iter()
+        .take(news_limit)
+        .map(|item| SimpleNewsItem {
+            headline: item.headline,
+            summary: item.summary,
+            source: item.source,
+            url: item.url,
+            date: chrono::DateTime::from_timestamp(item.datetime, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "Unknown".to_string()),
+            symbol: symbol.clone(),
+        })
+        .collect();
 
     let count = news.len();
 
     Ok(FetchNewsResponse { news, count })
+}
+
+/// Get cached news from local database
+#[tauri::command]
+fn get_cached_news(
+    state: State<AppState>,
+    symbol: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<SimpleNewsItem>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let news_limit = limit.unwrap_or(20);
+
+    let rows = if let Some(sym) = symbol {
+        db.get_news(&sym, news_limit).map_err(|e| e.to_string())?
+    } else {
+        db.get_recent_news(news_limit).map_err(|e| e.to_string())?
+    };
+
+    let news: Vec<SimpleNewsItem> = rows
+        .into_iter()
+        .map(|(_, sym, headline, summary, source, url, _, published)| SimpleNewsItem {
+            headline,
+            summary: summary.unwrap_or_default(),
+            source,
+            url,
+            date: published,
+            symbol: sym,
+        })
+        .collect();
+
+    Ok(news)
+}
+
+/// Save a news prediction for later accuracy tracking
+#[tauri::command]
+fn save_prediction(
+    state: State<AppState>,
+    finnhub_id: i64,
+    symbol: String,
+    _headline: String,  // Stored in news table, kept for API consistency
+    prediction_summary: String,
+    predicted_direction: Option<String>,
+    predicted_price: Option<f64>,
+    predicted_change_percent: Option<f64>,
+    source: String,
+    timeframe_days: Option<i64>,
+) -> Result<CommandResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let symbol = symbol.to_uppercase();
+    let timeframe = timeframe_days.unwrap_or(14);
+
+    // Get current price for baseline
+    let price_at_prediction = db.get_latest_price(&symbol)
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0.0);
+
+    if price_at_prediction == 0.0 {
+        return Err(format!("No price data for {}. Fetch prices first.", symbol));
+    }
+
+    // News ID is optional - we track by finnhub_id primarily
+    let news_id: i64 = 0;  // Will be looked up in db method if needed
+
+    db.save_news_prediction(
+        news_id,
+        finnhub_id,
+        &symbol,
+        if predicted_price.is_some() { "price_target" } else { "direction" },
+        predicted_direction.as_deref(),
+        predicted_price,
+        predicted_change_percent,
+        &prediction_summary,
+        price_at_prediction,
+        &source,
+        timeframe,
+    ).map_err(|e| e.to_string())?;
+
+    Ok(CommandResult {
+        success: true,
+        message: format!(
+            "Saved prediction for {} @ ${:.2}. Will verify in {} days.",
+            symbol, price_at_prediction, timeframe
+        ),
+    })
+}
+
+/// Response for prediction verification
+#[derive(Serialize)]
+struct VerificationResult {
+    prediction_id: i64,
+    symbol: String,
+    source: String,
+    predicted_direction: Option<String>,
+    predicted_change: Option<f64>,
+    actual_change: f64,
+    accurate: bool,
+    notes: String,
+}
+
+/// Verify pending predictions (retro-analyze)
+#[tauri::command]
+fn verify_predictions(
+    state: State<AppState>,
+) -> Result<Vec<VerificationResult>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    let pending = db.get_pending_verifications()
+        .map_err(|e| e.to_string())?;
+
+    let mut results = Vec::new();
+
+    for (id, symbol, direction, _predicted_price, predicted_change, price_at_pred, source) in pending {
+        // Get current price
+        let current_price = match db.get_latest_price(&symbol) {
+            Ok(Some(p)) => p,
+            _ => continue, // Skip if no current price
+        };
+
+        let actual_change = ((current_price - price_at_pred) / price_at_pred) * 100.0;
+
+        // Determine accuracy
+        let accurate = if let Some(pred_change) = predicted_change {
+            // If predicted specific change, check if direction matches and within 50% of magnitude
+            let direction_match = (pred_change > 0.0 && actual_change > 0.0) ||
+                                  (pred_change < 0.0 && actual_change < 0.0);
+            let magnitude_ok = (actual_change.abs() - pred_change.abs()).abs() < pred_change.abs() * 0.5;
+            direction_match && magnitude_ok
+        } else if let Some(ref dir) = Some(&direction) {
+            // If just direction, check if it matches
+            match dir.as_str() {
+                "bullish" => actual_change > 2.0,  // At least 2% up
+                "bearish" => actual_change < -2.0, // At least 2% down
+                _ => actual_change.abs() < 2.0,    // Neutral = stayed flat
+            }
+        } else {
+            false
+        };
+
+        let notes = format!(
+            "Predicted: {:?} / {:.1}%, Actual: {:.1}% (${:.2} → ${:.2})",
+            direction, predicted_change.unwrap_or(0.0), actual_change, price_at_pred, current_price
+        );
+
+        // Save verification
+        let _ = db.verify_prediction(id, current_price, actual_change, accurate, Some(&notes));
+
+        results.push(VerificationResult {
+            prediction_id: id,
+            symbol,
+            source,
+            predicted_direction: Some(direction),
+            predicted_change,
+            actual_change,
+            accurate,
+            notes,
+        });
+    }
+
+    println!("[OK] Verified {} predictions", results.len());
+    Ok(results)
+}
+
+/// Get source reliability scores
+#[tauri::command]
+fn get_source_scores(
+    state: State<AppState>,
+) -> Result<Vec<(String, i64, i64, f64, Option<f64>)>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_source_scores().map_err(|e| e.to_string())
+}
+
+/// Get predictions for a symbol
+#[tauri::command]
+fn get_predictions(
+    state: State<AppState>,
+    symbol: String,
+    include_verified: Option<bool>,
+) -> Result<Vec<(i64, String, Option<String>, Option<f64>, f64, String, Option<i32>, Option<f64>)>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_symbol_predictions(&symbol.to_uppercase(), include_verified.unwrap_or(true))
+        .map_err(|e| e.to_string())
 }
 
 /// Response for price reaction command
@@ -2339,7 +2611,7 @@ fn get_paper_balance(state: State<AppState>) -> Result<PaperWalletResponse, Stri
         .get_paper_portfolio_value()
         .map_err(|e| e.to_string())?;
 
-    let starting_capital = 100000.0; // Default starting capital
+    let starting_capital = 1_000_000.0; // Default starting capital (matches DB default)
     let total_pnl = total_equity - starting_capital;
     let total_pnl_percent = if starting_capital > 0.0 {
         (total_pnl / starting_capital) * 100.0
@@ -2400,6 +2672,7 @@ fn get_paper_positions(state: State<AppState>) -> Result<Vec<PaperPositionRespon
 /// Execute a paper trade
 #[tauri::command]
 fn execute_paper_trade(
+    app: tauri::AppHandle,
     state: State<AppState>,
     symbol: String,
     action: String,
@@ -2439,6 +2712,14 @@ fn execute_paper_trade(
         trade.symbol,
         trade.price
     );
+
+    // Emit trade event to frontend
+    let _ = app.emit("trade-executed", serde_json::json!({
+        "action": trade.action.as_str(),
+        "symbol": trade.symbol.clone(),
+        "quantity": trade.quantity,
+        "price": trade.price
+    }));
 
     Ok(PaperTradeResponse {
         id: trade.id,
@@ -3529,6 +3810,301 @@ async fn open_article_window(app: tauri::AppHandle, url: String, title: String) 
     Ok(())
 }
 
+// ============================================================================
+// Reports Commands
+// ============================================================================
+
+/// Report item for listing
+#[derive(Serialize)]
+struct ReportItem {
+    name: String,
+    path: String,
+    date: String,
+    report_type: String,
+    size_kb: u64,
+}
+
+/// Get list of all reports
+#[tauri::command]
+fn get_report_list() -> Result<Vec<ReportItem>, String> {
+    let mut reports = Vec::new();
+
+    // Base path for reports
+    let base_path = if cfg!(windows) {
+        r"X:\dev\carbyne-phinance/fp-tauri-dev"
+    } else {
+        "/mnt/x/dev/carbyne-phinance/fp-tauri-dev"
+    };
+
+    // Scan main reports directory
+    let reports_dir = format!("{}/reports", base_path);
+    if let Ok(entries) = std::fs::read_dir(&reports_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "md" || ext == "json" {
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Extract date from filename (format: xxx_YYYYMMDD.md)
+                        let date = name.split('_')
+                            .filter(|s| s.len() == 8 || s.contains('.'))
+                            .next()
+                            .map(|s| s.split('.').next().unwrap_or(s))
+                            .unwrap_or("")
+                            .to_string();
+
+                        let size_kb = entry.metadata()
+                            .map(|m| m.len() / 1024)
+                            .unwrap_or(0);
+
+                        let report_type = if name.contains("ai_trader") {
+                            "ai_trader"
+                        } else if name.contains("analysis") {
+                            "analysis"
+                        } else if name.contains("metrics") {
+                            "metrics"
+                        } else {
+                            "report"
+                        }.to_string();
+
+                        reports.push(ReportItem {
+                            name,
+                            path: path.to_string_lossy().to_string(),
+                            date,
+                            report_type,
+                            size_kb,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan trading_sim_logs directory
+    let sim_logs_dir = format!("{}/logs/trading_sim_logs", base_path);
+    if let Ok(date_dirs) = std::fs::read_dir(&sim_logs_dir) {
+        for date_dir in date_dirs.flatten() {
+            if date_dir.path().is_dir() {
+                let date = date_dir.file_name()
+                    .to_string_lossy()
+                    .to_string();
+
+                if let Ok(files) = std::fs::read_dir(date_dir.path()) {
+                    for file in files.flatten() {
+                        let path = file.path();
+                        if path.is_file() {
+                            if let Some(ext) = path.extension() {
+                                if ext == "md" || ext == "json" || ext == "log" {
+                                    let name = path.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+
+                                    let size_kb = file.metadata()
+                                        .map(|m| m.len() / 1024)
+                                        .unwrap_or(0);
+
+                                    let report_type = if name.contains("debate") {
+                                        "debate"
+                                    } else if name.contains("research") {
+                                        "research"
+                                    } else if name.contains("consensus") {
+                                        "consensus"
+                                    } else if name.contains("session") {
+                                        "session"
+                                    } else if name.contains("orders") {
+                                        "orders"
+                                    } else {
+                                        "sim_log"
+                                    }.to_string();
+
+                                    reports.push(ReportItem {
+                                        name,
+                                        path: path.to_string_lossy().to_string(),
+                                        date: date.clone(),
+                                        report_type,
+                                        size_kb,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan ai_decisions directory
+    let ai_decisions_dir = format!("{}/logs/ai_decisions", base_path);
+    if let Ok(entries) = std::fs::read_dir(&ai_decisions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "json" || ext == "jsonl" {
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Extract date from filename (format: ai_decision_YYYYMMDD_HHMMSS.json)
+                        let date = name.split('_')
+                            .nth(2)
+                            .unwrap_or("")
+                            .to_string();
+
+                        let size_kb = entry.metadata()
+                            .map(|m| m.len() / 1024)
+                            .unwrap_or(0);
+
+                        let report_type = if name.contains("decisions_") {
+                            "daily_decisions"
+                        } else if name == "index.json" {
+                            "index"
+                        } else {
+                            "ai_decision"
+                        }.to_string();
+
+                        reports.push(ReportItem {
+                            name,
+                            path: path.to_string_lossy().to_string(),
+                            date,
+                            report_type,
+                            size_kb,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Also scan raw subdirectory
+    let ai_raw_dir = format!("{}/logs/ai_decisions/raw", base_path);
+    if let Ok(entries) = std::fs::read_dir(&ai_raw_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "json" {
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        let date = name.split('_')
+                            .nth(2)
+                            .unwrap_or("")
+                            .to_string();
+
+                        let size_kb = entry.metadata()
+                            .map(|m| m.len() / 1024)
+                            .unwrap_or(0);
+
+                        reports.push(ReportItem {
+                            name,
+                            path: path.to_string_lossy().to_string(),
+                            date,
+                            report_type: "raw_response".to_string(),
+                            size_kb,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by date descending
+    reports.sort_by(|a, b| b.date.cmp(&a.date));
+
+    Ok(reports)
+}
+
+/// Get report content
+#[tauri::command]
+fn get_report_content(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read report: {}", e))
+}
+
+/// Generate PDF from markdown report
+#[tauri::command]
+fn generate_pdf_report(source_path: String) -> Result<CommandResult, String> {
+    // For now, just return success - PDF generation would require additional setup
+    // The Python tools exist at /mnt/x/dev/carbyne-phinance/fp-tauri-dev/tools/
+
+    // Check if source exists
+    if !std::path::Path::new(&source_path).exists() {
+        return Ok(CommandResult {
+            success: false,
+            message: format!("Source file not found: {}", source_path),
+        });
+    }
+
+    // In future, could shell out to Python script:
+    // python tools/kalic_report_regen.py <source_path>
+
+    Ok(CommandResult {
+        success: true,
+        message: "PDF generation queued. Use the Python tools for now.".to_string(),
+    })
+}
+
+// ============================================================================
+// CONFIG PERSISTENCE (survives rebuilds)
+// ============================================================================
+
+/// Config stored in data/config.json
+#[derive(Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    finnhub_api_key: Option<String>,
+}
+
+fn get_config_path() -> String {
+    get_data_path("config.json")
+}
+
+/// Save Finnhub API key to config file
+#[tauri::command]
+fn save_finnhub_key(key: String) -> Result<CommandResult, String> {
+    let config_path = get_config_path();
+
+    // Load existing config or create new
+    let mut config: AppConfig = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    config.finnhub_api_key = if key.is_empty() { None } else { Some(key) };
+
+    let json = serde_json::to_string_pretty(&config)
+        .map_err(|e| e.to_string())?;
+
+    std::fs::write(&config_path, json)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    Ok(CommandResult {
+        success: true,
+        message: "Finnhub API key saved".to_string(),
+    })
+}
+
+/// Load Finnhub API key from config file
+#[tauri::command]
+fn load_finnhub_key() -> Result<Option<String>, String> {
+    let config_path = get_config_path();
+
+    let config: AppConfig = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    Ok(config.finnhub_api_key)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize database with absolute path to avoid CWD issues
@@ -3536,8 +4112,25 @@ pub fn run() {
     let db = Database::open(&db_path).expect("Failed to open database");
     db.init_schema().expect("Failed to initialize schema");
 
+    // Wrap in Arc for sharing between Tauri and HTTP server
+    let db = Arc::new(Mutex::new(db));
+    let db_for_http = Arc::clone(&db);
+
+    // Start HTTP API server in background thread for LAN browser access
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(http_api::start_server(db_for_http, 3001));
+    });
+
+    // Start trade queue scheduler in background thread
+    let db_for_scheduler = Arc::clone(&db);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create scheduler runtime");
+        rt.block_on(scheduler::run_scheduler(db_for_scheduler));
+    });
+
     tauri::Builder::default()
-        .manage(AppState { db: Mutex::new(db) })
+        .manage(AppState { db })
         .invoke_handler(tauri::generate_handler![
             get_symbols,
             toggle_favorite,
@@ -3606,6 +4199,12 @@ pub fn run() {
             ollama_ask,
             // Finnhub news commands
             fetch_news,
+            get_cached_news,
+            // Prediction tracking
+            save_prediction,
+            verify_predictions,
+            get_source_scores,
+            get_predictions,
             fetch_price_reaction,
             fetch_candles,
             // Enhanced event saving with pattern linking
@@ -3653,6 +4252,13 @@ pub fn run() {
             ai_trader_update_circuit_breaker,
             ai_trader_get_rejections,
             ai_trader_get_circuit_breaker_events,
+            // Reports commands
+            get_report_list,
+            get_report_content,
+            generate_pdf_report,
+            // Config persistence
+            save_finnhub_key,
+            load_finnhub_key,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -3662,7 +4268,62 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // System tray for termination resistance
+            use tauri::tray::TrayIconBuilder;
+            use tauri::menu::{MenuBuilder, MenuItemBuilder};
+
+            let show_item = MenuItemBuilder::with_id("show", "Show Trading").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+            let menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Trading - Auto-Trade Scheduler Active")
+                .menu(&menu)
+                .on_menu_event(|app: &tauri::AppHandle, event| {
+                    match event.id().as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            std::process::exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray: &tauri::tray::TrayIcon, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up, ..
+                    } = event {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            println!("[TRAY] System tray initialized - close button minimizes to tray");
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Termination resistance: closing X minimizes to tray instead
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                window.hide().ok();
+                println!("[TRAY] Window hidden to tray (scheduler + HTTP API still running)");
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

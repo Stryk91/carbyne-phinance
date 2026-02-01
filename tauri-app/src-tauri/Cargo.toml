@@ -18,7 +18,7 @@ tauri-build = { version = "2.5.1", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.9.2", features = [] }
+tauri = { version = "2.9.2", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 
 # Our financial pipeline library
@@ -29,6 +29,11 @@ chrono = "0.4"
 
 # URL parsing for security validation
 url = "2.5"
+
+# HTTP API server for LAN access
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower-http = { version = "0.5", features = ["cors"] }
 
 [package.metadata.tauri-cli.dev]
 # Ignore database files to prevent hot-reload when data changes

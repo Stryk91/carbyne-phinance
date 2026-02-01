@@ -2,7 +2,7 @@
 # Usage: . .\devlog-append.ps1; Add-DevLogEntry -Title "My Change" -Author "KALIC" -Files "file1.rs,file2.ts" -Summary "What I did"
 # Usage: Add-DevLogError -Error "npm not found" -When "Running build" -Fix "Added to PATH"
 
-$DevLogPath = "X:\dev\financial-pipeline-rs\DEV_LOG.md"
+$DevLogPath = "X:\dev\carbyne-phinance\fp-tauri-dev\DEV_LOG.md"
 
 function Add-DevLogEntry {
     param(

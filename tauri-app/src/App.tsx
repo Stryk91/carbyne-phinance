@@ -1,20 +1,69 @@
-import { Component, Switch, Match, onMount, onCleanup, createEffect } from 'solid-js';
-import { TitleBar, ActivityBar, Sidebar, Panel, StatusBar } from './components/layout';
+import { Component, Switch, Match, onMount, onCleanup } from 'solid-js';
+import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { ActivityBar, Sidebar, Panel, StatusBar } from './components/layout';
+import { addLog, addOutput, addProblem } from './components/layout/Panel';
 import { CommandPalette } from './components/navigation';
-import { Dashboard } from './views';
+import { NewsDetail } from './components/NewsDetail';
+import { Dashboard, Charts, Symbols, Portfolio, AiTrader, TradeQueue, Alerts, Reports, Settings } from './views';
 import { appStore, setupKeyboardShortcuts, symbolStore } from './stores';
 import './styles/index.css';
 
 const App: Component = () => {
   let cleanupShortcuts: (() => void) | undefined;
+  let unlistenFns: UnlistenFn[] = [];
 
-  onMount(() => {
+  onMount(async () => {
     // Setup keyboard shortcuts
     cleanupShortcuts = setupKeyboardShortcuts();
-    
+
     // Initialize with a default selected symbol
     if (!symbolStore.state.selectedSymbol) {
       symbolStore.selectSymbol('AAPL');
+    }
+
+    // Log app startup
+    addLog('App initialized', 'output');
+    addOutput('System', 'Application started');
+
+    // Listen for Tauri backend events
+    try {
+      // Listen for log events from backend
+      unlistenFns.push(await listen<{ message: string; level: string }>('app-log', (event) => {
+        const { message, level } = event.payload;
+        if (level === 'error') {
+          addLog(`[BACKEND] ${message}`, 'error');
+          addProblem('error', message, 'Backend');
+        } else if (level === 'warning') {
+          addLog(`[BACKEND] ${message}`, 'output');
+          addProblem('warning', message, 'Backend');
+        } else {
+          addLog(`[BACKEND] ${message}`, 'output');
+        }
+      }));
+
+      // Listen for trade execution events
+      unlistenFns.push(await listen<{ action: string; symbol: string; quantity: number; price: number }>('trade-executed', (event) => {
+        const { action, symbol, quantity, price } = event.payload;
+        addLog(`[TRADE] ${action} ${quantity} ${symbol} @ $${price.toFixed(2)}`, 'output');
+        addOutput('Trading', `${action} ${quantity} ${symbol} @ $${price.toFixed(2)}`);
+      }));
+
+      // Listen for price updates
+      unlistenFns.push(await listen<{ symbol: string; price: number }>('price-update', (event) => {
+        const { symbol, price } = event.payload;
+        addOutput('Market Data', `${symbol}: $${price.toFixed(2)}`);
+      }));
+
+      // Listen for alert triggers
+      unlistenFns.push(await listen<{ symbol: string; condition: string; target_price: number }>('alert-triggered', (event) => {
+        const { symbol, condition, target_price } = event.payload;
+        addLog(`[ALERT] ${symbol} ${condition} $${target_price.toFixed(2)}`, 'output');
+        addOutput('Alerts', `${symbol} hit ${condition} $${target_price.toFixed(2)}`);
+        addProblem('warning', `Alert: ${symbol} ${condition} $${target_price}`, 'Price Alerts');
+      }));
+    } catch (e) {
+      // Not running in Tauri context
+      addLog('Running in browser mode', 'output');
     }
   });
 
@@ -22,6 +71,8 @@ const App: Component = () => {
     if (cleanupShortcuts) {
       cleanupShortcuts();
     }
+    // Cleanup all Tauri event listeners
+    unlistenFns.forEach(fn => fn());
   });
 
   // Get the current view icon based on active view
@@ -70,6 +121,7 @@ const App: Component = () => {
       charts: 'Charts',
       portfolio: 'Portfolio',
       'ai-trader': 'AI Trader',
+      'trade-queue': 'Trade Queue',
       alerts: 'Alerts',
       settings: 'Settings',
     };
@@ -78,7 +130,6 @@ const App: Component = () => {
 
   return (
     <div class="app-container">
-      <TitleBar />
       <ActivityBar />
       <Sidebar />
       
@@ -98,46 +149,28 @@ const App: Component = () => {
             <Dashboard />
           </Match>
           <Match when={appStore.state.activeView === 'symbols'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                Symbols view - implementation pending
-              </div>
-            </div>
+            <Symbols />
           </Match>
           <Match when={appStore.state.activeView === 'charts'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                Charts view - implementation pending
-              </div>
-            </div>
+            <Charts />
           </Match>
           <Match when={appStore.state.activeView === 'portfolio'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                Portfolio view - implementation pending
-              </div>
-            </div>
+            <Portfolio />
           </Match>
           <Match when={appStore.state.activeView === 'ai-trader'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                AI Trader view - implementation pending
-              </div>
-            </div>
+            <AiTrader />
+          </Match>
+          <Match when={appStore.state.activeView === 'trade-queue'}>
+            <TradeQueue />
           </Match>
           <Match when={appStore.state.activeView === 'alerts'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                Alerts view - implementation pending
-              </div>
-            </div>
+            <Alerts />
+          </Match>
+          <Match when={appStore.state.activeView === 'reports'}>
+            <Reports />
           </Match>
           <Match when={appStore.state.activeView === 'settings'}>
-            <div class="editor-content">
-              <div style={{ color: 'var(--text-secondary)', padding: 'var(--space-4)' }}>
-                Settings view - implementation pending
-              </div>
-            </div>
+            <Settings />
           </Match>
         </Switch>
         
@@ -146,6 +179,7 @@ const App: Component = () => {
       
       <StatusBar />
       <CommandPalette />
+      <NewsDetail />
     </div>
   );
 };

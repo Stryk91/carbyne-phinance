@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 fn main() {
-    let conn = Connection::open(r"X:\dev\financial-pipeline-rs\data\finance.db")
+    let conn = Connection::open(r"X:\dev\carbyne-phinance/fp-tauri-dev\data\finance.db")
         .expect("Failed to open database");
 
     println!("Updating AI Trader config...\n");

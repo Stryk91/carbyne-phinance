@@ -48,9 +48,11 @@ impl YahooFinance {
         );
 
         // Yahoo Finance API endpoint
+        // Yahoo uses dashes for class shares (BRK-B), DB may store dots (BRK.B)
+        let yahoo_symbol = symbol.replace('.', "-");
         let url = format!(
             "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range={}",
-            symbol, period
+            yahoo_symbol, period
         );
 
         let response = self.client.get(&url).send()?;

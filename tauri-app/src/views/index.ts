@@ -1,1 +1,9 @@
 export { Dashboard } from './Dashboard';
+export { Charts } from './Charts';
+export { Symbols } from './Symbols';
+export { Portfolio } from './Portfolio';
+export { AiTrader } from './AiTrader';
+export { Alerts } from './Alerts';
+export { Reports } from './Reports';
+export { Settings } from './Settings';
+export { TradeQueue } from './TradeQueue';

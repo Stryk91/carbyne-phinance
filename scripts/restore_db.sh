@@ -2,7 +2,7 @@
 # Quick restore from backup
 
 BACKUP_DIR="/home/STRYK/ai_trader_backup"
-DB_PATH="/mnt/x/dev/financial-pipeline-rs/data/finance.db"
+DB_PATH="/mnt/x/dev/carbyne-phinance/fp-tauri-dev/data/finance.db"
 
 echo "=== Available Backups ==="
 ls -lht "$BACKUP_DIR"/finance_*.db 2>/dev/null | head -10

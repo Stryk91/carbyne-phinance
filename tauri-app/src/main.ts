@@ -2648,7 +2648,7 @@ function setupEventListeners(): void {
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
-    log('Financial Pipeline UI loaded', 'success');
+    log('UI loaded', 'success');
     setupEventListeners();
     refreshSymbolList();
     updateLastRefreshTime();

@@ -15,7 +15,7 @@ async fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     // 1. Open database
-    let db_path = r"X:\dev\financial-pipeline-rs\data\finance.db";
+    let db_path = r"X:\dev\carbyne-phinance/fp-tauri-dev\data\finance.db";
     println!("📂 Opening database: {}", db_path);
     let mut db = match Database::open(db_path) {
         Ok(d) => d,

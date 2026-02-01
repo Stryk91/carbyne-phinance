@@ -71,4 +71,6 @@ pub use models::{
     AiPredictionAccuracy, AiTraderStatus, BenchmarkComparison, CompoundingForecast,
     // DC Trader types
     DcWallet, DcPosition, DcTrade, PortfolioSnapshot, TeamConfig, ImportResult, CompetitionStats,
+    // Trade queue types
+    QueuedTrade, QueueLogEntry,
 };

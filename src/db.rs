@@ -15,6 +15,8 @@ use crate::models::{
     AiTraderConfig, AiTradingSession, AiTradeDecision, AiPerformanceSnapshot, AiPredictionAccuracy,
     // DC Trader types
     DcWallet, DcPosition, DcTrade, PortfolioSnapshot, TeamConfig, ImportResult, CompetitionStats,
+    // Trade queue types
+    QueuedTrade, QueueLogEntry,
 };
 use crate::trends::TrendData;
 
@@ -60,6 +62,11 @@ impl Database {
         self.run_migrations()?;
         println!("[OK] Database schema initialized");
         Ok(())
+    }
+
+    /// Get direct access to the connection (for advanced queries)
+    pub fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Run database migrations for existing tables
@@ -2743,6 +2750,196 @@ impl Database {
     }
 
     // ========================================================================
+    // Trade Queue Methods (auto-trigger trading)
+    // ========================================================================
+
+    /// Queue a trade for scheduled execution
+    pub fn queue_trade(
+        &self,
+        portfolio: &str,
+        symbol: &str,
+        action: &str,
+        quantity: f64,
+        target_price: Option<f64>,
+        source: &str,
+        debate_date: Option<&str>,
+        conviction: Option<i32>,
+        reasoning: Option<&str>,
+        scheduled_for: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO trade_queue (portfolio, symbol, action, quantity, target_price, source, debate_date, conviction, reasoning, scheduled_for)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                portfolio, symbol.to_uppercase(), action.to_uppercase(),
+                quantity, target_price, source, debate_date, conviction, reasoning, scheduled_for
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+
+        // Log the queue event
+        self.log_queue_event(id, "queued", Some(&format!(
+            "{} {} {} {} @ {}",
+            portfolio, action, quantity, symbol,
+            target_price.map(|p| format!("${:.2}", p)).unwrap_or_else(|| "market".to_string())
+        )))?;
+
+        Ok(id)
+    }
+
+    /// Get queued trades filtered by status
+    pub fn get_queued_trades(&self, status: Option<&str>) -> Result<Vec<QueuedTrade>> {
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
+            Some(s) => (
+                "SELECT id, portfolio, symbol, action, quantity, target_price, status, source,
+                        debate_date, conviction, reasoning, created_at, scheduled_for,
+                        executed_at, execution_price, execution_trade_id, error_message
+                 FROM trade_queue WHERE status = ?1 ORDER BY created_at DESC",
+                vec![Box::new(s.to_string())],
+            ),
+            None => (
+                "SELECT id, portfolio, symbol, action, quantity, target_price, status, source,
+                        debate_date, conviction, reasoning, created_at, scheduled_for,
+                        executed_at, execution_price, execution_trade_id, error_message
+                 FROM trade_queue ORDER BY created_at DESC",
+                vec![],
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let trades = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(QueuedTrade {
+                id: row.get(0)?,
+                portfolio: row.get(1)?,
+                symbol: row.get(2)?,
+                action: row.get(3)?,
+                quantity: row.get(4)?,
+                target_price: row.get(5)?,
+                status: row.get(6)?,
+                source: row.get(7)?,
+                debate_date: row.get(8)?,
+                conviction: row.get(9)?,
+                reasoning: row.get(10)?,
+                created_at: row.get(11)?,
+                scheduled_for: row.get(12)?,
+                executed_at: row.get(13)?,
+                execution_price: row.get(14)?,
+                execution_trade_id: row.get(15)?,
+                error_message: row.get(16)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(trades)
+    }
+
+    /// Get all queue entries with limit
+    pub fn get_trade_queue_all(&self, limit: usize) -> Result<Vec<QueuedTrade>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, portfolio, symbol, action, quantity, target_price, status, source,
+                    debate_date, conviction, reasoning, created_at, scheduled_for,
+                    executed_at, execution_price, execution_trade_id, error_message
+             FROM trade_queue ORDER BY created_at DESC LIMIT ?1"
+        )?;
+        let trades = stmt.query_map([limit as i64], |row| {
+            Ok(QueuedTrade {
+                id: row.get(0)?,
+                portfolio: row.get(1)?,
+                symbol: row.get(2)?,
+                action: row.get(3)?,
+                quantity: row.get(4)?,
+                target_price: row.get(5)?,
+                status: row.get(6)?,
+                source: row.get(7)?,
+                debate_date: row.get(8)?,
+                conviction: row.get(9)?,
+                reasoning: row.get(10)?,
+                created_at: row.get(11)?,
+                scheduled_for: row.get(12)?,
+                executed_at: row.get(13)?,
+                execution_price: row.get(14)?,
+                execution_trade_id: row.get(15)?,
+                error_message: row.get(16)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(trades)
+    }
+
+    /// Update queue entry status after execution attempt
+    pub fn update_queue_status(
+        &self,
+        id: i64,
+        new_status: &str,
+        execution_price: Option<f64>,
+        execution_trade_id: Option<i64>,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        let executed_at = if new_status == "executed" || new_status == "failed" {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        self.conn.execute(
+            "UPDATE trade_queue SET status = ?1, execution_price = ?2, execution_trade_id = ?3,
+             error_message = ?4, executed_at = ?5 WHERE id = ?6",
+            rusqlite::params![new_status, execution_price, execution_trade_id, error_message, executed_at, id],
+        )?;
+        Ok(())
+    }
+
+    /// Cancel a queued trade
+    pub fn cancel_queued_trade(&self, id: i64) -> Result<()> {
+        let affected = self.conn.execute(
+            "UPDATE trade_queue SET status = 'cancelled' WHERE id = ?1 AND status = 'queued'",
+            [id],
+        )?;
+        if affected == 0 {
+            return Err(crate::error::PipelineError::ApiError(format!("Trade {} not found or not in queued status", id)));
+        }
+        self.log_queue_event(id, "cancelled", Some("Cancelled by user"))?;
+        Ok(())
+    }
+
+    /// Log a queue event to the audit trail
+    pub fn log_queue_event(&self, queue_id: i64, event: &str, details: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO trade_queue_log (queue_id, event, details) VALUES (?1, ?2, ?3)",
+            rusqlite::params![queue_id, event, details],
+        )?;
+        Ok(())
+    }
+
+    /// Get audit log for a queue entry
+    pub fn get_queue_log(&self, queue_id: i64) -> Result<Vec<QueueLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, queue_id, event, details, timestamp FROM trade_queue_log
+             WHERE queue_id = ?1 ORDER BY timestamp ASC"
+        )?;
+        let entries = stmt.query_map([queue_id], |row| {
+            Ok(QueueLogEntry {
+                id: row.get(0)?,
+                queue_id: row.get(1)?,
+                event: row.get(2)?,
+                details: row.get(3)?,
+                timestamp: row.get(4)?,
+            })
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Count trades in a given status
+    pub fn count_queued_trades(&self, status: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM trade_queue WHERE status = ?1",
+            [status],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    // ========================================================================
     // AI Trading Simulator Methods
     // ========================================================================
 
@@ -3353,6 +3550,286 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ========================================================================
+    // News Methods
+    // ========================================================================
+
+    /// Save a news item (upsert by finnhub_id)
+    pub fn save_news(
+        &self,
+        finnhub_id: i64,
+        symbol: &str,
+        headline: &str,
+        summary: Option<&str>,
+        source: &str,
+        url: &str,
+        image_url: Option<&str>,
+        published_at: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO news
+            (finnhub_id, symbol, headline, summary, source, url, image_url, published_at, fetched_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime(?8, 'unixepoch'), CURRENT_TIMESTAMP)
+            "#,
+            params![finnhub_id, symbol, headline, summary, source, url, image_url, published_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get news for a symbol (most recent first)
+    pub fn get_news(&self, symbol: &str, limit: usize) -> Result<Vec<(i64, String, String, Option<String>, String, String, Option<String>, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT finnhub_id, symbol, headline, summary, source, url, image_url, published_at
+            FROM news
+            WHERE symbol = ?1
+            ORDER BY published_at DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![symbol, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Get all recent news (across all symbols)
+    pub fn get_recent_news(&self, limit: usize) -> Result<Vec<(i64, String, String, Option<String>, String, String, Option<String>, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT finnhub_id, symbol, headline, summary, source, url, image_url, published_at
+            FROM news
+            ORDER BY published_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Check if news exists by finnhub_id
+    pub fn news_exists(&self, finnhub_id: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM news WHERE finnhub_id = ?1",
+            params![finnhub_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Cleanup old news (older than days)
+    pub fn cleanup_old_news(&self, days: i64) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM news WHERE published_at < datetime('now', ?1)",
+            params![format!("-{} days", days)],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Update news sentiment
+    pub fn update_news_sentiment(&self, finnhub_id: i64, sentiment: &str, score: f64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE news SET sentiment = ?1, sentiment_score = ?2 WHERE finnhub_id = ?3",
+            params![sentiment, score, finnhub_id],
+        )?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // News Prediction Tracking Methods
+    // ========================================================================
+
+    /// Save a prediction extracted from news
+    pub fn save_news_prediction(
+        &self,
+        news_id: i64,
+        finnhub_id: i64,
+        symbol: &str,
+        prediction_type: &str,
+        predicted_direction: Option<&str>,
+        predicted_price: Option<f64>,
+        predicted_change_percent: Option<f64>,
+        prediction_summary: &str,
+        price_at_prediction: f64,
+        source: &str,
+        timeframe_days: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r#"
+            INSERT INTO news_predictions
+            (news_id, finnhub_id, symbol, prediction_type, predicted_direction,
+             predicted_price, predicted_change_percent, prediction_summary,
+             price_at_prediction, prediction_date, timeframe_days, verify_after, source)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP, ?10,
+                    datetime('now', '+' || ?10 || ' days'), ?11)
+            "#,
+            params![
+                news_id, finnhub_id, symbol, prediction_type, predicted_direction,
+                predicted_price, predicted_change_percent, prediction_summary,
+                price_at_prediction, timeframe_days, source
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get predictions ready for verification
+    pub fn get_pending_verifications(&self) -> Result<Vec<(i64, String, String, Option<f64>, Option<f64>, f64, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, symbol, predicted_direction, predicted_price, predicted_change_percent,
+                   price_at_prediction, source
+            FROM news_predictions
+            WHERE prediction_accurate IS NULL
+              AND verify_after <= CURRENT_TIMESTAMP
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Verify a prediction with actual outcome
+    pub fn verify_prediction(
+        &self,
+        prediction_id: i64,
+        price_at_verification: f64,
+        actual_change_percent: f64,
+        accurate: bool,
+        notes: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE news_predictions SET
+                verified_at = CURRENT_TIMESTAMP,
+                price_at_verification = ?1,
+                actual_change_percent = ?2,
+                prediction_accurate = ?3,
+                accuracy_notes = ?4
+            WHERE id = ?5
+            "#,
+            params![price_at_verification, actual_change_percent, accurate as i32, notes, prediction_id],
+        )?;
+
+        // Update source scores
+        self.update_source_score_for_prediction(prediction_id)?;
+        Ok(())
+    }
+
+    /// Update aggregated source scores after verifying a prediction
+    fn update_source_score_for_prediction(&self, prediction_id: i64) -> Result<()> {
+        // Get the source for this prediction
+        let source: String = self.conn.query_row(
+            "SELECT source FROM news_predictions WHERE id = ?1",
+            params![prediction_id],
+            |row| row.get(0),
+        )?;
+
+        // Recalculate source stats
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO news_source_scores (source, total_predictions, accurate_predictions, accuracy_rate, avg_error_percent, last_updated)
+            SELECT
+                source,
+                COUNT(*) as total,
+                SUM(CASE WHEN prediction_accurate = 1 THEN 1 ELSE 0 END) as accurate,
+                ROUND(100.0 * SUM(CASE WHEN prediction_accurate = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) as rate,
+                ROUND(AVG(ABS(COALESCE(predicted_change_percent, 0) - actual_change_percent)), 2) as avg_err,
+                CURRENT_TIMESTAMP
+            FROM news_predictions
+            WHERE source = ?1 AND prediction_accurate IS NOT NULL
+            GROUP BY source
+            "#,
+            params![source],
+        )?;
+        Ok(())
+    }
+
+    /// Get source reliability scores
+    pub fn get_source_scores(&self) -> Result<Vec<(String, i64, i64, f64, Option<f64>)>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT source, total_predictions, accurate_predictions, accuracy_rate, avg_error_percent
+            FROM news_source_scores
+            ORDER BY accuracy_rate DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
+
+    /// Get predictions for a symbol (for review)
+    pub fn get_symbol_predictions(&self, symbol: &str, include_verified: bool) -> Result<Vec<(i64, String, Option<String>, Option<f64>, f64, String, Option<i32>, Option<f64>)>> {
+        let sql = if include_verified {
+            r#"
+            SELECT id, prediction_summary, predicted_direction, predicted_price,
+                   price_at_prediction, source, prediction_accurate, actual_change_percent
+            FROM news_predictions
+            WHERE symbol = ?1
+            ORDER BY prediction_date DESC
+            "#
+        } else {
+            r#"
+            SELECT id, prediction_summary, predicted_direction, predicted_price,
+                   price_at_prediction, source, prediction_accurate, actual_change_percent
+            FROM news_predictions
+            WHERE symbol = ?1 AND prediction_accurate IS NULL
+            ORDER BY prediction_date DESC
+            "#
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![symbol], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i32>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ))
+        })?;
+        Ok(rows.collect::<SqliteResult<Vec<_>>>()?)
+    }
 }
 
 /// Database schema SQL
@@ -3854,4 +4331,60 @@ CREATE TABLE IF NOT EXISTS trading_teams (
     dc_starting_capital REAL DEFAULT 1000000.0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- News cache (Finnhub news stored locally)
+CREATE TABLE IF NOT EXISTS news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    finnhub_id INTEGER UNIQUE NOT NULL,
+    symbol TEXT NOT NULL,
+    headline TEXT NOT NULL,
+    summary TEXT,
+    source TEXT,
+    url TEXT,
+    image_url TEXT,
+    published_at TIMESTAMP NOT NULL,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sentiment TEXT,
+    sentiment_score REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_symbol ON news(symbol);
+CREATE INDEX IF NOT EXISTS idx_news_published ON news(published_at);
+CREATE INDEX IF NOT EXISTS idx_news_finnhub_id ON news(finnhub_id);
+
+-- Trade queue for scheduled execution (market open auto-trade)
+CREATE TABLE IF NOT EXISTS trade_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    portfolio TEXT NOT NULL CHECK(portfolio IN ('KALIC', 'DC')),
+    symbol TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('BUY', 'SELL')),
+    quantity REAL NOT NULL,
+    target_price REAL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued', 'executing', 'executed', 'failed', 'cancelled')),
+    source TEXT NOT NULL DEFAULT 'debate',
+    debate_date TEXT,
+    conviction INTEGER,
+    reasoning TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    scheduled_for TEXT,
+    executed_at TIMESTAMP,
+    execution_price REAL,
+    execution_trade_id INTEGER,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_queue_status ON trade_queue(status);
+CREATE INDEX IF NOT EXISTS idx_trade_queue_portfolio ON trade_queue(portfolio);
+
+-- Trade queue audit log
+CREATE TABLE IF NOT EXISTS trade_queue_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queue_id INTEGER NOT NULL REFERENCES trade_queue(id),
+    event TEXT NOT NULL,
+    details TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_queue_log_queue_id ON trade_queue_log(queue_id);
 "#;

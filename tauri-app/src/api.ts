@@ -1,6 +1,22 @@
-// Tauri API wrapper
+// Tauri API wrapper with HTTP fallback for browser access
 
 import { invoke } from '@tauri-apps/api/core';
+import { addLog, addOutput, addProblem } from './components/layout/Panel';
+
+// Detect if running in Tauri or browser
+const isTauri = (): boolean => '__TAURI__' in window;
+
+// HTTP API base URL (Tauri app runs server on port 3001)
+const API_BASE = `http://${window.location.hostname}:3001`;
+
+// Generic HTTP fetch helper
+async function httpGet<T>(endpoint: string): Promise<T> {
+    const response = await fetch(`${API_BASE}${endpoint}`);
+    if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+    }
+    return response.json();
+}
 
 // Types matching Rust structs
 export interface SymbolPrice {
@@ -67,8 +83,16 @@ export interface Portfolio {
 }
 
 // API functions
+let lastSymbolFetchTime = 0;
 export async function getSymbols(): Promise<SymbolPrice[]> {
-    return invoke('get_symbols');
+    const now = Date.now();
+    const result = isTauri() ? await invoke<SymbolPrice[]>('get_symbols') : await httpGet<SymbolPrice[]>('/api/symbols');
+    // Log only every 30 seconds to avoid spam
+    if (now - lastSymbolFetchTime > 30000) {
+        lastSymbolFetchTime = now;
+        addOutput('Market Data', `Loaded ${result.length} symbols`);
+    }
+    return result;
 }
 
 export async function toggleFavorite(symbol: string): Promise<boolean> {
@@ -76,6 +100,7 @@ export async function toggleFavorite(symbol: string): Promise<boolean> {
 }
 
 export async function getFavoritedSymbols(): Promise<string[]> {
+    if (!isTauri()) return httpGet('/api/favorited');
     return invoke('get_favorited_symbols');
 }
 
@@ -90,7 +115,17 @@ export async function favoritePaperPositions(): Promise<CommandResult> {
 }
 
 export async function fetchPrices(symbols: string, period: string): Promise<CommandResult> {
-    return invoke('fetch_prices', { symbols, period });
+    const symbolList = symbols.split(',').map(s => s.trim()).filter(s => s);
+    addLog(`[MARKET] Fetching ${symbolList.length} symbol(s): ${symbols}`, 'command');
+    try {
+        const result = await invoke<CommandResult>('fetch_prices', { symbols, period });
+        addOutput('Market Data', `Fetched prices for ${symbolList.length} symbol(s)`);
+        return result;
+    } catch (err) {
+        addLog(`[MARKET] Fetch failed: ${err}`, 'error');
+        addProblem('warning', `Price fetch failed: ${err}`, 'Yahoo Finance');
+        throw err;
+    }
 }
 
 export async function fetchFred(indicators: string): Promise<CommandResult> {
@@ -106,6 +141,7 @@ export async function calculateIndicators(symbol: string): Promise<CommandResult
 }
 
 export async function getIndicators(symbol: string): Promise<IndicatorData[]> {
+    if (!isTauri()) return httpGet(`/api/symbols/${symbol}/indicators`);
     return invoke('get_indicators', { symbol });
 }
 
@@ -114,6 +150,7 @@ export async function getIndicatorHistory(symbol: string, indicatorName: string)
 }
 
 export async function getPriceHistory(symbol: string): Promise<PriceData[]> {
+    if (!isTauri()) return httpGet(`/api/symbols/${symbol}/prices`);
     return invoke('get_price_history', { symbol });
 }
 
@@ -131,6 +168,7 @@ export async function addAlert(symbol: string, targetPrice: number, condition: s
 }
 
 export async function getAlerts(onlyActive: boolean): Promise<Alert[]> {
+    if (!isTauri()) return httpGet('/api/alerts');
     return invoke('get_alerts', { onlyActive });
 }
 
@@ -139,7 +177,14 @@ export async function deleteAlert(alertId: number): Promise<CommandResult> {
 }
 
 export async function checkAlerts(): Promise<Alert[]> {
-    return invoke('check_alerts');
+    const triggeredAlerts = await invoke<Alert[]>('check_alerts');
+    if (triggeredAlerts.length > 0) {
+        triggeredAlerts.forEach(alert => {
+            addLog(`[ALERT] ${alert.symbol} ${alert.condition} $${alert.target_price} TRIGGERED!`, 'output');
+            addOutput('Price Alerts', `${alert.symbol} hit ${alert.condition} $${alert.target_price}`);
+        });
+    }
+    return triggeredAlerts;
 }
 
 // Portfolio
@@ -155,6 +200,14 @@ export async function addPosition(
 }
 
 export async function getPortfolio(): Promise<Portfolio> {
+    if (!isTauri()) {
+        const positions = await httpGet<Position[]>('/api/portfolio');
+        const total_value = positions.reduce((sum, p) => sum + p.current_value, 0);
+        const total_profit_loss = positions.reduce((sum, p) => sum + p.profit_loss, 0);
+        const cost_basis = positions.reduce((sum, p) => sum + (p.price * p.quantity), 0);
+        const total_profit_loss_percent = cost_basis > 0 ? (total_profit_loss / cost_basis) * 100 : 0;
+        return { positions, total_value, total_profit_loss, total_profit_loss_percent };
+    }
     return invoke('get_portfolio');
 }
 
@@ -192,6 +245,10 @@ export async function createWatchlist(name: string, symbols: string[], descripti
 }
 
 export async function getAllWatchlists(): Promise<WatchlistSummary[]> {
+    if (!isTauri()) {
+        const watchlists = await httpGet<{ id: number; name: string; description: string | null; symbols: string[] }[]>('/api/watchlists');
+        return watchlists.map(w => ({ id: w.id, name: w.name, description: w.description, symbol_count: w.symbols.length }));
+    }
     return invoke('get_all_watchlists');
 }
 
@@ -307,6 +364,50 @@ export interface FetchNewsResponse {
 
 export async function fetchNews(symbol: string, apiKey: string, limit: number = 5): Promise<FetchNewsResponse> {
     return invoke('fetch_news', { symbol, apiKey, limit });
+}
+
+// Prediction tracking
+export interface SavePredictionParams {
+    finnhub_id: number;
+    symbol: string;
+    headline: string;
+    prediction_summary: string;
+    predicted_direction?: 'bullish' | 'bearish' | 'neutral';
+    predicted_price?: number;
+    predicted_change_percent?: number;
+    source: string;
+    timeframe_days?: number;
+}
+
+export async function savePrediction(params: SavePredictionParams): Promise<CommandResult> {
+    return invoke('save_prediction', { ...params });
+}
+
+export interface VerificationResult {
+    prediction_id: number;
+    symbol: string;
+    source: string;
+    predicted_direction: string | null;
+    predicted_change: number | null;
+    actual_change: number;
+    accurate: boolean;
+    notes: string;
+}
+
+export async function verifyPredictions(): Promise<VerificationResult[]> {
+    return invoke('verify_predictions');
+}
+
+export interface SourceScore {
+    source: string;
+    total: number;
+    accurate: number;
+    rate: number;
+    avg_error: number | null;
+}
+
+export async function getSourceScores(): Promise<[string, number, number, number, number | null][]> {
+    return invoke('get_source_scores');
 }
 
 // Price Reaction (candle data around an event)
@@ -431,11 +532,38 @@ export interface PaperTrade {
 
 // Get paper trading balance and portfolio summary
 export async function getPaperBalance(): Promise<PaperWalletBalance> {
+    if (!isTauri()) {
+        const data = await httpGet<{ cash: number; positions_value: number; total_value: number }>('/api/paper/balance');
+        const starting_capital = 1000000; // Default starting capital (matches DB default)
+        return {
+            cash: data.cash,
+            positions_value: data.positions_value,
+            total_equity: data.total_value,
+            starting_capital,
+            total_pnl: data.total_value - starting_capital,
+            total_pnl_percent: ((data.total_value - starting_capital) / starting_capital) * 100,
+        };
+    }
     return invoke('get_paper_balance');
 }
 
 // Get all paper trading positions with current values
 export async function getPaperPositions(): Promise<PaperPosition[]> {
+    if (!isTauri()) {
+        const positions = await httpGet<{ symbol: string; shares: number; avg_cost: number; current_price: number; market_value: number; unrealized_pnl: number; unrealized_pnl_percent: number }[]>('/api/paper/positions');
+        return positions.map((p, i) => ({
+            id: i,
+            symbol: p.symbol,
+            quantity: p.shares,
+            entry_price: p.avg_cost,
+            entry_date: '',
+            current_price: p.current_price,
+            current_value: p.market_value,
+            cost_basis: p.avg_cost * p.shares,
+            unrealized_pnl: p.unrealized_pnl,
+            unrealized_pnl_percent: p.unrealized_pnl_percent,
+        }));
+    }
     return invoke('get_paper_positions');
 }
 
@@ -447,7 +575,18 @@ export async function executePaperTrade(
     price?: number,
     notes?: string
 ): Promise<PaperTrade> {
-    return invoke('execute_paper_trade', { symbol, action, quantity, price, notes });
+    try {
+        addLog(`[KALIC] ${action} ${quantity} ${symbol}${price ? ` @ $${price.toFixed(2)}` : ''}...`, 'command');
+        const trade = await invoke<PaperTrade>('execute_paper_trade', { symbol, action, quantity, price, notes });
+        const value = trade.quantity * trade.price;
+        addLog(`[KALIC] EXECUTED: ${action} ${trade.quantity} ${symbol} @ $${trade.price.toFixed(2)} = $${value.toFixed(2)}`);
+        addOutput('KALIC Trader', `${action} ${symbol} x${trade.quantity} @ $${trade.price.toFixed(2)}`);
+        return trade;
+    } catch (err) {
+        addLog(`[KALIC] FAILED: ${action} ${symbol} - ${err}`, 'error');
+        addProblem('error', `Trade failed: ${action} ${symbol} - ${err}`, 'KALIC Trader');
+        throw err;
+    }
 }
 
 // Get paper trade history
@@ -457,7 +596,10 @@ export async function getPaperTrades(symbol?: string, limit?: number): Promise<P
 
 // Reset paper trading account
 export async function resetPaperAccount(startingCash?: number): Promise<CommandResult> {
-    return invoke('reset_paper_account', { startingCash });
+    addLog(`[KALIC] RESET account to $${(startingCash || 1000000).toLocaleString()}`, 'command');
+    const result = await invoke<CommandResult>('reset_paper_account', { startingCash });
+    addOutput('KALIC Trader', `Account reset to $${(startingCash || 1000000).toLocaleString()}`);
+    return result;
 }
 
 // ============================================================================
@@ -538,11 +680,38 @@ export interface CompetitionStats {
 
 // Get DC wallet balance and portfolio summary
 export async function getDcBalance(): Promise<DcWalletBalance> {
+    if (!isTauri()) {
+        const data = await httpGet<{ cash: number; positions_value: number; total_value: number }>('/api/dc/balance');
+        const starting_capital = 1000000; // Default starting capital (matches DB default)
+        return {
+            cash: data.cash,
+            positions_value: data.positions_value,
+            total_equity: data.total_value,
+            starting_capital,
+            total_pnl: data.total_value - starting_capital,
+            total_pnl_percent: ((data.total_value - starting_capital) / starting_capital) * 100,
+        };
+    }
     return invoke('get_dc_balance');
 }
 
 // Get all DC positions with current values
 export async function getDcPositions(): Promise<DcPosition[]> {
+    if (!isTauri()) {
+        const positions = await httpGet<{ symbol: string; shares: number; avg_cost: number; current_price: number; market_value: number; unrealized_pnl: number; unrealized_pnl_percent: number }[]>('/api/dc/positions');
+        return positions.map((p, i) => ({
+            id: i,
+            symbol: p.symbol,
+            quantity: p.shares,
+            entry_price: p.avg_cost,
+            entry_date: '',
+            current_price: p.current_price,
+            current_value: p.market_value,
+            cost_basis: p.avg_cost * p.shares,
+            unrealized_pnl: p.unrealized_pnl,
+            unrealized_pnl_percent: p.unrealized_pnl_percent,
+        }));
+    }
     return invoke('get_dc_positions');
 }
 
@@ -554,7 +723,18 @@ export async function executeDcTrade(
     price?: number,
     notes?: string
 ): Promise<DcTrade> {
-    return invoke('execute_dc_trade', { symbol, action, quantity, price, notes });
+    try {
+        addLog(`[DC] ${action} ${quantity} ${symbol}${price ? ` @ $${price.toFixed(2)}` : ''}...`, 'command');
+        const trade = await invoke<DcTrade>('execute_dc_trade', { symbol, action, quantity, price, notes });
+        const value = trade.quantity * trade.price;
+        addLog(`[DC] EXECUTED: ${action} ${trade.quantity} ${symbol} @ $${trade.price.toFixed(2)} = $${value.toFixed(2)}`);
+        addOutput('DC Trader', `${action} ${symbol} x${trade.quantity} @ $${trade.price.toFixed(2)}`);
+        return trade;
+    } catch (err) {
+        addLog(`[DC] FAILED: ${action} ${symbol} - ${err}`, 'error');
+        addProblem('error', `Trade failed: ${action} ${symbol} - ${err}`, 'DC Trader');
+        throw err;
+    }
 }
 
 // Get DC trade history
@@ -564,7 +744,10 @@ export async function getDcTrades(limit?: number): Promise<DcTrade[]> {
 
 // Reset DC trading account
 export async function resetDcAccount(startingCash?: number): Promise<CommandResult> {
-    return invoke('reset_dc_account', { starting_cash: startingCash });
+    addLog(`[DC] RESET account to $${(startingCash || 1000000).toLocaleString()}`, 'command');
+    const result = await invoke<CommandResult>('reset_dc_account', { starting_cash: startingCash });
+    addOutput('DC Trader', `Account reset to $${(startingCash || 1000000).toLocaleString()}`);
+    return result;
 }
 
 // Import DC trades from CSV
@@ -609,6 +792,27 @@ export async function listTeamConfigs(): Promise<TeamConfig[]> {
 
 // Get competition stats
 export async function getCompetitionStats(): Promise<CompetitionStats> {
+    if (!isTauri()) {
+        const data = await httpGet<{
+            kalic_value: number; kalic_pnl: number; kalic_pnl_percent: number; kalic_trades: number;
+            dc_value: number; dc_pnl: number; dc_pnl_percent: number; dc_trades: number;
+            leader: string; lead_amount: number;
+        }>('/api/competition/stats');
+        return {
+            kalic_total: data.kalic_value,
+            kalic_cash: 0, // Not in HTTP response
+            kalic_positions: data.kalic_value,
+            kalic_pnl_pct: data.kalic_pnl_percent,
+            kalic_trades: data.kalic_trades,
+            dc_total: data.dc_value,
+            dc_cash: 0,
+            dc_positions: data.dc_value,
+            dc_pnl_pct: data.dc_pnl_percent,
+            dc_trades: data.dc_trades,
+            leader: data.leader,
+            lead_amount: data.lead_amount,
+        };
+    }
     return invoke('get_competition_stats');
 }
 
@@ -773,4 +977,107 @@ export async function aiTraderEvaluatePredictions(): Promise<number> {
 // Reset AI trading
 export async function aiTraderReset(startingCapital?: number): Promise<CommandResult> {
     return invoke('ai_trader_reset', { startingCapital });
+}
+
+// ============================================================================
+// REPORTS
+// ============================================================================
+
+export interface ReportItem {
+    name: string;
+    path: string;
+    date: string;
+    report_type: string;
+    size_kb: number;
+}
+
+// Get list of all reports
+export async function getReportList(): Promise<ReportItem[]> {
+    if (!isTauri()) return httpGet('/api/reports');
+    return invoke('get_report_list');
+}
+
+// Get report content
+export async function getReportContent(path: string): Promise<string> {
+    if (!isTauri()) {
+        const response = await fetch(`${API_BASE}/api/reports/content?path=${encodeURIComponent(path)}`);
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        return response.text();
+    }
+    return invoke('get_report_content', { path });
+}
+
+// Generate PDF from markdown report
+export async function generatePdfReport(sourcePath: string): Promise<CommandResult> {
+    return invoke('generate_pdf_report', { sourcePath });
+}
+
+// ============================================================================
+// Trade Queue API
+// ============================================================================
+
+export interface QueuedTrade {
+    id: number;
+    portfolio: string;
+    symbol: string;
+    action: string;
+    quantity: number;
+    target_price: number | null;
+    status: string;
+    source: string;
+    debate_date: string | null;
+    conviction: number | null;
+    reasoning: string | null;
+    created_at: string;
+    scheduled_for: string | null;
+    executed_at: string | null;
+    execution_price: number | null;
+    execution_trade_id: number | null;
+    error_message: string | null;
+}
+
+export interface SchedulerStatus {
+    running: boolean;
+    queued_count: number;
+    current_et_time: string;
+    market_open: boolean;
+    next_market_open: string;
+}
+
+export interface QueueResponse {
+    id: number;
+    status: string;
+    message: string;
+}
+
+export interface BatchQueueResponse {
+    queued: QueueResponse[];
+    total: number;
+    success_count: number;
+    fail_count: number;
+}
+
+export async function getTradeQueue(status?: string): Promise<QueuedTrade[]> {
+    const params = status ? `?status=${status}` : '';
+    const response = await fetch(`${API_BASE}/api/queue${params}`);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return response.json();
+}
+
+export async function cancelQueuedTrade(id: number): Promise<QueueResponse> {
+    const response = await fetch(`${API_BASE}/api/queue/${id}/cancel`, { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return response.json();
+}
+
+export async function getSchedulerStatus(): Promise<SchedulerStatus> {
+    const response = await fetch(`${API_BASE}/api/scheduler/status`);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return response.json();
+}
+
+export async function getPendingQueueCount(): Promise<{ count: number }> {
+    const response = await fetch(`${API_BASE}/api/queue/pending-count`);
+    if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+    return response.json();
 }

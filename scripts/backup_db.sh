@@ -6,10 +6,10 @@
 set +e
 
 # Config
-DB_PATH="/mnt/x/dev/financial-pipeline-rs/data/finance.db"
-BACKUP_DIR_WIN="/mnt/x/dev/financial-pipeline-rs/logs/backups"
+DB_PATH="/mnt/x/dev/carbyne-phinance/fp-tauri-dev/data/finance.db"
+BACKUP_DIR_WIN="/mnt/x/dev/carbyne-phinance/fp-tauri-dev/logs/backups"
 BACKUP_DIR_LINUX="/home/STRYK/ai_trader_backup"
-TRADES_JSONL="/mnt/x/dev/financial-pipeline-rs/logs/trades/trades_all.jsonl"
+TRADES_JSONL="/mnt/x/dev/carbyne-phinance/fp-tauri-dev/logs/trades/trades_all.jsonl"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 KEEP_DAYS=30
 
