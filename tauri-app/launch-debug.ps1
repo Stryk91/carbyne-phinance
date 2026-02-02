@@ -1,0 +1,7 @@
+# Launch Financial Pipeline with CDP debugging enabled
+# Fix PATH for WSL->PowerShell bridge
+$env:PATH = "C:\Program Files\nodejs;C:\Users\Stryker_LOCAL\.cargo\bin;$env:PATH"
+$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9222"
+Start-Process "X:\dev\financial-pipeline-rs\tauri-app\src-tauri\target\debug\financial-pipeline-gui.exe"
+Write-Host "App launched with CDP on ws://localhost:9222"
+Write-Host "Connect with: chrome://inspect or any CDP client"
