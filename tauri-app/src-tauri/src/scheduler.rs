@@ -33,6 +33,8 @@ pub async fn run_scheduler(db: SharedDb) {
 
     // Track if we already executed today to avoid double-execution
     let mut last_execution_date: Option<String> = None;
+    // Track last position price refresh (every 10 minutes)
+    let mut last_position_refresh: Option<chrono::DateTime<Utc>> = None;
 
     loop {
         let now_utc = Utc::now();
@@ -45,33 +47,96 @@ pub async fn run_scheduler(db: SharedDb) {
 
         let is_weekday = !matches!(weekday, Weekday::Sat | Weekday::Sun);
 
-        // Execute at 9:30 ET on weekdays, within a 2-minute window
+        // --- 10-minute position refresh (always, regardless of day/time) ---
+        let needs_position_refresh = match last_position_refresh {
+            None => true,
+            Some(last) => (now_utc - last).num_seconds() >= 600,
+        };
+
+        if needs_position_refresh {
+            refresh_held_positions(&db).await;
+            last_position_refresh = Some(now_utc);
+        }
+
+        // --- Market open: daily full refresh + queued trade execution ---
         let is_market_open_window = is_weekday
             && hour == 9
             && minute >= 30
-            && minute <= 31
+            && minute <= 39
             && last_execution_date.as_deref() != Some(&today);
 
         if is_market_open_window {
-            // Check if there are queued trades
+            // Full refresh: favorited + held symbols with 5d lookback
+            refresh_daily_prices(&db).await;
+
+            // Then check for queued trades
             let has_queued = {
                 let db_guard = db.lock().unwrap();
                 db_guard.count_queued_trades("queued").unwrap_or(0) > 0
             };
 
             if has_queued {
-                log::info!("[SCHEDULER] Market open detected - executing queued trades");
+                log::info!("[SCHEDULER] Executing queued trades");
                 execute_queued_trades(&db).await;
-                last_execution_date = Some(today);
             } else {
-                log::info!("[SCHEDULER] Market open - no queued trades");
-                last_execution_date = Some(today);
+                log::info!("[SCHEDULER] No queued trades");
             }
+
+            last_execution_date = Some(today);
         }
 
         // Sleep 30 seconds between checks
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
     }
+}
+
+/// Refresh prices for all held positions (KALIC + DC) — runs every 10 minutes
+async fn refresh_held_positions(db: &SharedDb) {
+    let symbols: Vec<String> = {
+        let db_guard = db.lock().unwrap();
+        let mut syms = Vec::new();
+        if let Ok(positions) = db_guard.get_paper_positions() {
+            for p in &positions { syms.push(p.symbol.clone()); }
+        }
+        if let Ok(positions) = db_guard.get_dc_positions() {
+            for p in &positions { syms.push(p.symbol.clone()); }
+        }
+        syms.sort();
+        syms.dedup();
+        syms
+    };
+
+    if symbols.is_empty() {
+        return;
+    }
+
+    log::info!("[SCHEDULER] Position refresh (10min): {} symbols", symbols.len());
+    refresh_prices_for_symbols(db, &symbols, "1d").await;
+}
+
+/// Daily price refresh for favorited + held position symbols
+async fn refresh_daily_prices(db: &SharedDb) {
+    let symbols: Vec<String> = {
+        let db_guard = db.lock().unwrap();
+        let mut syms = db_guard.get_favorited_symbols().unwrap_or_default();
+        if let Ok(positions) = db_guard.get_paper_positions() {
+            for p in &positions { syms.push(p.symbol.clone()); }
+        }
+        if let Ok(positions) = db_guard.get_dc_positions() {
+            for p in &positions { syms.push(p.symbol.clone()); }
+        }
+        syms.sort();
+        syms.dedup();
+        syms
+    };
+
+    if symbols.is_empty() {
+        log::info!("[SCHEDULER] No symbols to refresh (no favorites or positions)");
+        return;
+    }
+
+    log::info!("[SCHEDULER] Daily price refresh: {} symbols", symbols.len());
+    refresh_prices_for_symbols(db, &symbols, "5d").await;
 }
 
 /// Execute all queued trades: refresh prices, execute, log results
@@ -92,7 +157,7 @@ async fn execute_queued_trades(db: &SharedDb) {
     let symbols: HashSet<String> = queued.iter().map(|t| t.symbol.clone()).collect();
     let symbols_vec: Vec<String> = symbols.into_iter().collect();
 
-    refresh_prices_for_symbols(db, &symbols_vec).await;
+    refresh_prices_for_symbols(db, &symbols_vec, "1d").await;
 
     // Step 3: Execute each trade
     let mut results = Vec::new();
@@ -185,18 +250,19 @@ async fn execute_queued_trades(db: &SharedDb) {
 }
 
 /// Refresh Yahoo Finance prices for the given symbols
-async fn refresh_prices_for_symbols(db: &SharedDb, symbols: &[String]) {
-    log::info!("[SCHEDULER] Refreshing prices for {} symbols", symbols.len());
+async fn refresh_prices_for_symbols(db: &SharedDb, symbols: &[String], period: &str) {
+    log::info!("[SCHEDULER] Refreshing prices for {} symbols (period={})", symbols.len(), period);
 
     let db_clone = db.clone();
     let symbols = symbols.to_vec();
+    let period = period.to_string();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut db_guard = db_clone.lock().unwrap();
         let yahoo = YahooFinance::new();
 
         for symbol in &symbols {
-            match yahoo.fetch_and_store(&mut db_guard, symbol, "1d") {
+            match yahoo.fetch_and_store(&mut db_guard, symbol, &period) {
                 Ok(_) => log::info!("[SCHEDULER] Refreshed price: {}", symbol),
                 Err(e) => log::warn!("[SCHEDULER] Failed to refresh {}: {}", symbol, e),
             }
